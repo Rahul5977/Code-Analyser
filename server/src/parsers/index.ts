@@ -1,11 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// src/interfaces/index.ts – Barrel export for all interfaces
+// src/parsers/index.ts – Barrel export for parsers
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type { DependencyRisk, RepoManifest } from "./repo-manifest.interface";
-export type {
-  CodeSmell,
-  CFG,
-  ParsedChunk,
-  TriageResult,
-} from "./triage.interface";
+export { parseAndTriage } from "./ast.parser";
