@@ -1,9 +1,5 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// src/index.ts
-//
-// Minimal Express server that exposes the Smart Ingestor as a REST endpoint.
 // POST /api/v1/ingest  →  { repoUrl, jobId? }  →  RepoManifest
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 import express, { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
