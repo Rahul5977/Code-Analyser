@@ -1,20 +1,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// src/interfaces/index.ts – Barrel export for all interfaces
+// src/graph-rag/index.ts – Barrel export for Phase 3: GraphRAG & Vector Storage
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type { DependencyRisk, RepoManifest } from "./repo-manifest.interface";
-export type {
-  CodeSmell,
-  CFG,
-  ParsedChunk,
-  TriageResult,
-} from "./triage.interface";
-export type {
-  GraphRagContext,
-  DiffResult,
-  QdrantChunkPayload,
-  Neo4jChunkProps,
-  GraphRagConfig,
-  EmbedFunction,
-  EmbedBatchFunction,
-} from "./graph-rag.interface";
+export { computeHash, computeDiff } from "./diff.engine";
+export { QdrantStore } from "./qdrant.store";
+export { Neo4jStore } from "./neo4j.store";
+export { GraphRagService } from "./graph-rag.service";
+export type { SyncReport } from "./graph-rag.service";
