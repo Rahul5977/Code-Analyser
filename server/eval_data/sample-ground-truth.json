@@ -1,0 +1,49 @@
+[
+  {
+    "name": "OWASP NodeGoat",
+    "repoUrl": "https://github.com/OWASP/NodeGoat.git",
+    "commitHash": "HEAD",
+    "vulnerabilities": [
+      {
+        "filePath": "app/routes/session.js",
+        "ruleId": "SQL_INJECTION",
+        "line": 46,
+        "severity": "CRITICAL",
+        "expectedAgent": "security",
+        "description": "NoSQL injection in user login via unsanitised req.body"
+      },
+      {
+        "filePath": "app/routes/contributions.js",
+        "ruleId": "XSS",
+        "line": 32,
+        "severity": "HIGH",
+        "expectedAgent": "security",
+        "description": "Reflected XSS — user input rendered without escaping"
+      },
+      {
+        "filePath": "app/routes/profile.js",
+        "ruleId": "IDOR",
+        "line": 18,
+        "severity": "HIGH",
+        "expectedAgent": "security",
+        "description": "Insecure direct object reference — no authorisation check"
+      },
+      {
+        "filePath": "app/data/user-dao.js",
+        "ruleId": "INSECURE_CRYPTO",
+        "line": 25,
+        "severity": "MEDIUM",
+        "expectedAgent": "security",
+        "description": "Weak password hashing (no salt, MD5)"
+      },
+      {
+        "filePath": "server.js",
+        "ruleId": "MISSING_SECURITY_HEADERS",
+        "line": 15,
+        "severity": "LOW",
+        "expectedAgent": "security",
+        "description": "Missing Helmet / security headers middleware"
+      }
+    ]
+  }
+]
