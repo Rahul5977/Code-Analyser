@@ -17,7 +17,12 @@ import { Request, Response } from "express";
 import { Queue } from "bullmq";
 import { v4 as uuidv4 } from "uuid";
 
-import { channelForJob, createSubscriber, getRedisConfig } from "./pubsub";
+import {
+  channelForJob,
+  createSubscriber,
+  getRedisConfig,
+  getBufferedEvents,
+} from "./pubsub";
 import { logger } from "../utils/logger";
 import type {
   CouncilReport,
@@ -241,6 +246,88 @@ export async function streamProgress(
     return;
   }
 
+  // ── Replay buffered events (fixes race condition) ──────────────────────
+  //
+  // The BullMQ worker may have started processing (and publishing events)
+  // before this SSE client connected.  We replay any events buffered in
+  // Redis so the client doesn't miss anything.  After replay, the live
+  // pub/sub subscription above takes over for any new events.
+  //
+  // De-duplication: events received via live pub/sub during the replay
+  // window are tracked by timestamp to avoid sending duplicates.
+  // ──────────────────────────────────────────────────────────────────────
+  try {
+    const buffered = await getBufferedEvents(jobId);
+    const seenTimestamps = new Set<string>();
+
+    for (const raw of buffered) {
+      if (closed) break;
+
+      // Track what we've replayed so live events don't duplicate
+      try {
+        const parsed = JSON.parse(raw) as {
+          timestamp?: string;
+          event?: string;
+        };
+        if (parsed.timestamp) seenTimestamps.add(parsed.timestamp);
+      } catch {
+        /* non-JSON — still replay it */
+      }
+
+      res.write(`data: ${raw}\n\n`);
+
+      // Check if this was the terminal event — job already finished
+      try {
+        const parsed = JSON.parse(raw) as { event?: string };
+        if (parsed.event === "job:cleanup:complete") {
+          res.write(
+            `data: ${JSON.stringify({ event: "stream:end", jobId, timestamp: new Date().toISOString() })}\n\n`,
+          );
+          res.end();
+          cleanup();
+          return;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // Patch the live message handler to skip duplicates from the replay window
+    subscriber.removeAllListeners("message");
+    subscriber.on("message", (ch: string, rawMessage: string) => {
+      if (ch !== channel || closed) return;
+
+      // De-duplicate: skip events we already replayed from the buffer
+      try {
+        const parsed = JSON.parse(rawMessage) as { timestamp?: string };
+        if (parsed.timestamp && seenTimestamps.has(parsed.timestamp)) return;
+      } catch {
+        /* non-JSON — forward it */
+      }
+
+      res.write(`data: ${rawMessage}\n\n`);
+
+      try {
+        const payload = JSON.parse(rawMessage) as { event?: string };
+        if (payload.event === "job:cleanup:complete") {
+          res.write(
+            `data: ${JSON.stringify({ event: "stream:end", jobId, timestamp: new Date().toISOString() })}\n\n`,
+          );
+          res.end();
+          cleanup();
+        }
+      } catch {
+        /* Not valid JSON — still forwarded, just no event check */
+      }
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(
+      LOG_CTX,
+      `Failed to replay buffered events for job=${jobId}: ${msg}`,
+    );
+  }
+
   // ── Client disconnect (browser tab closed) — critical leak prevention ──
   req.on("close", () => {
     logger.debug(
@@ -302,21 +389,17 @@ export async function compareReports(
   const reportB = getReport(jobB);
 
   if (!reportA) {
-    res
-      .status(404)
-      .json({
-        error: "Not Found",
-        message: `Report for jobA="${jobA}" not found.`,
-      });
+    res.status(404).json({
+      error: "Not Found",
+      message: `Report for jobA="${jobA}" not found.`,
+    });
     return;
   }
   if (!reportB) {
-    res
-      .status(404)
-      .json({
-        error: "Not Found",
-        message: `Report for jobB="${jobB}" not found.`,
-      });
+    res.status(404).json({
+      error: "Not Found",
+      message: `Report for jobB="${jobB}" not found.`,
+    });
     return;
   }
 

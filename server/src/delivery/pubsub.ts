@@ -112,10 +112,43 @@ export interface ProgressPayload {
   data?: unknown; // Optional structured payload
 }
 
+// ─── Event Buffering ─────────────────────────────────────────────────────────
+//
+// Redis Pub/Sub is fire-and-forget: if no subscriber is listening when a
+// message is published, the message is lost.  This is the root cause of the
+// "stuck streaming" bug — the BullMQ worker processes the job and publishes
+// all progress events before the frontend's SSE connection has subscribed.
+//
+// Solution: alongside every PUBLISH, we also RPUSH each event into a Redis
+// list keyed by jobId.  When an SSE client connects, it replays the buffer
+// first, then switches to live pub/sub.  The buffer auto-expires after 1 hour.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Redis key for the event replay buffer of a job. */
+export function bufferKeyForJob(jobId: string): string {
+  return `buffer:repo-progress:${jobId}`;
+}
+
+/** TTL for buffered events (1 hour — plenty for any analysis run). */
+const BUFFER_TTL_SECONDS = 3600;
+
+/**
+ * Returns all previously buffered events for a job (for replay on SSE connect).
+ */
+export async function getBufferedEvents(jobId: string): Promise<string[]> {
+  try {
+    const pub = getPublisher();
+    return await pub.lrange(bufferKeyForJob(jobId), 0, -1);
+  } catch {
+    return [];
+  }
+}
+
 // ─── Publish Helper ──────────────────────────────────────────────────────────
 
 /**
- * Publishes a progress event on the job's channel.
+ * Publishes a progress event on the job's channel AND appends it to a
+ * Redis list for replay by late-joining SSE clients.
  *
  * Safe to call from any context (BullMQ worker, agent tool, etc.).
  * If the publisher is unavailable, the error is swallowed with a warning
@@ -142,7 +175,16 @@ export async function publishProgress(
 
   try {
     const pub = getPublisher();
-    await pub.publish(channelForJob(jobId), JSON.stringify(payload));
+    const serialised = JSON.stringify(payload);
+    const bufferKey = bufferKeyForJob(jobId);
+
+    // Atomic: buffer + publish + set TTL in a pipeline
+    await pub
+      .pipeline()
+      .rpush(bufferKey, serialised)
+      .expire(bufferKey, BUFFER_TTL_SECONDS)
+      .publish(channelForJob(jobId), serialised)
+      .exec();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn(LOG_CTX, `Failed to publish progress for job=${jobId}: ${msg}`);

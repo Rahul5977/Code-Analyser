@@ -10,6 +10,8 @@ export {
   closePubSub,
   channelForJob,
   getRedisConfig,
+  getBufferedEvents,
+  bufferKeyForJob,
 } from "./pubsub";
 export type { RedisConfig, ProgressPayload } from "./pubsub";
 
