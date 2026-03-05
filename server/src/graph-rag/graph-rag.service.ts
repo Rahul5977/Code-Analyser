@@ -48,32 +48,43 @@ export interface SyncReport {
 // ─── Service Class ───────────────────────────────────────────────────────────
 
 export class GraphRagService {
-  private readonly qdrant: QdrantStore;
-  private readonly neo4j: Neo4jStore;
-  private readonly embedFn: EmbedFunction;
+  private readonly _qdrant: QdrantStore;
+  private readonly _neo4j: Neo4jStore;
+  private readonly _embedFn: EmbedFunction;
   private readonly embedBatchFn?: EmbedBatchFunction;
   private initialised = false;
+
+  // ── Public accessors for Phase 4 council integration ──
+  get qdrant(): QdrantStore {
+    return this._qdrant;
+  }
+  get neo4j(): Neo4jStore {
+    return this._neo4j;
+  }
+  get embedFn(): EmbedFunction {
+    return this._embedFn;
+  }
 
   constructor(
     config: GraphRagConfig,
     embedFn: EmbedFunction,
     embedBatchFn?: EmbedBatchFunction,
   ) {
-    this.qdrant = new QdrantStore(
+    this._qdrant = new QdrantStore(
       config.qdrant.url,
       config.embeddingDimension,
       config.qdrant.collectionName ?? "code_chunks",
       config.qdrant.apiKey,
     );
 
-    this.neo4j = new Neo4jStore(
+    this._neo4j = new Neo4jStore(
       config.neo4j.uri,
       config.neo4j.username,
       config.neo4j.password,
       config.neo4j.database ?? "neo4j",
     );
 
-    this.embedFn = embedFn;
+    this._embedFn = embedFn;
     this.embedBatchFn = embedBatchFn;
   }
 

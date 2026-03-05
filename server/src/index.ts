@@ -4,6 +4,7 @@
 // POST /api/v1/graph-rag/sync    →  { repoUrl }   →  SyncReport (Ingest + Triage + Sync)
 // POST /api/v1/graph-rag/search  →  { query, repoId, topK?, maxDepth? }  →  GraphRagContext
 // DELETE /api/v1/graph-rag/repo  →  { repoId }    →  OK
+// POST /api/v1/council/analyse   →  { repoUrl, repoId?, jobId? }  →  CouncilReport
 
 import express, { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
@@ -11,11 +12,15 @@ import { v4 as uuidv4 } from "uuid";
 import { ingestRepository } from "./ingestors";
 import { parseAndTriage } from "./parsers";
 import { GraphRagService } from "./graph-rag";
+import { runCouncil } from "./council";
 import { logger } from "./utils/logger";
 import type {
   GraphRagConfig,
   EmbedFunction,
   EmbedBatchFunction,
+  LLMMessage,
+  LLMCompletionFn,
+  CouncilConfig,
 } from "./interfaces";
 
 // ── Server Setup ──────────────────────────────────────────────────────────────
@@ -89,6 +94,80 @@ const stubEmbedBatchFn: EmbedBatchFunction = async (
 ): Promise<number[][]> => {
   return Promise.all(texts.map((t) => stubEmbedFn(t)));
 };
+
+// ─── Stub LLM Completion Function ───────────────────────────────────────────
+//
+// In production, replace with a real LLM provider (OpenAI, Anthropic, etc.).
+// This stub simulates a basic LLM that returns a canned response.
+// It supports tool calls by returning a simple structured response.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const stubLlmFn: LLMCompletionFn = async (
+  messages: LLMMessage[],
+  _tools?: import("./interfaces").ToolDefinition[],
+  _temperature?: number,
+): Promise<LLMMessage> => {
+  // In production, replace this with:
+  //   const response = await openai.chat.completions.create({ messages, tools, temperature });
+  //
+  // This stub returns a basic response that allows the pipeline to complete.
+  const lastUserMsg = messages.filter((m) => m.role === "user").pop();
+  const content = lastUserMsg?.content ?? "";
+
+  // If the system prompt asks for JSON, return a minimal valid JSON response
+  const systemMsg = messages.find((m) => m.role === "system");
+  const isJsonRequest = systemMsg?.content.includes("JSON") ?? false;
+
+  if (isJsonRequest && content.includes("analysis plan")) {
+    return {
+      role: "assistant",
+      content: JSON.stringify({
+        securityTargets: [],
+        performanceTargets: [],
+        architectureScope: { focusModules: [] },
+        testCoverageEnabled: false,
+        crossReferences: [],
+      }),
+    };
+  }
+
+  if (isJsonRequest && content.includes("findings")) {
+    return { role: "assistant", content: "[]" };
+  }
+
+  if (isJsonRequest && content.includes("architectural")) {
+    return {
+      role: "assistant",
+      content: JSON.stringify({
+        circularDependencies: [],
+        couplingScores: [],
+        godClasses: [],
+        layerViolations: [],
+        detectedPattern: "Unknown",
+        summary: "Stub LLM — replace with a real provider for actual analysis.",
+      }),
+    };
+  }
+
+  return {
+    role: "assistant",
+    content:
+      "Stub LLM response. Replace with a real LLM provider (OpenAI, Anthropic, Ollama, etc.) for actual analysis.",
+  };
+};
+
+/** Returns the default council configuration */
+function getCouncilConfig(): CouncilConfig {
+  return {
+    llmFn: stubLlmFn,
+    maxIterations: Number(process.env["COUNCIL_MAX_ITERATIONS"] ?? "10"),
+    maxReinvestigations: Number(
+      process.env["COUNCIL_MAX_REINVESTIGATIONS"] ?? "2",
+    ),
+    disputeThreshold: Number(process.env["COUNCIL_DISPUTE_THRESHOLD"] ?? "0.6"),
+    temperature: Number(process.env["COUNCIL_TEMPERATURE"] ?? "0.3"),
+  };
+}
 
 async function getGraphRagService(): Promise<GraphRagService> {
   if (!graphRagService) {
@@ -421,6 +500,110 @@ app.delete(
   },
 );
 
+// ─── Phase 4: Council Endpoints ──────────────────────────────────────────────
+
+interface CouncilAnalyseRequestBody {
+  repoUrl?: string;
+  repoId?: string;
+  jobId?: string;
+}
+
+app.post(
+  "/api/v1/council/analyse",
+  async (req: Request, res: Response): Promise<void> => {
+    const body = req.body as CouncilAnalyseRequestBody;
+    const { repoUrl, jobId: providedJobId } = body;
+
+    if (!repoUrl || typeof repoUrl !== "string") {
+      res.status(400).json({
+        error: "Bad Request",
+        message: "`repoUrl` is required and must be a non-empty string.",
+      });
+      return;
+    }
+
+    const jobId = providedJobId ?? uuidv4();
+
+    logger.info(
+      "Server",
+      `Council analysis pipeline  jobId=${jobId}  repo=${repoUrl}`,
+    );
+
+    try {
+      // Phase 1 – Ingest
+      const manifest = await ingestRepository(repoUrl, jobId);
+
+      // Phase 2 – Parse & Triage
+      const triage = await parseAndTriage(
+        manifest.targetFiles,
+        manifest.localPath,
+      );
+
+      // Derive repoId
+      const repoId =
+        body.repoId ??
+        repoUrl
+          .replace(/\.git$/, "")
+          .split("/")
+          .filter(Boolean)
+          .slice(-2)
+          .join("/") ??
+        jobId;
+
+      // Phase 3 – Vector + Graph Sync
+      const service = await getGraphRagService();
+      await service.sync(triage, repoId);
+
+      // Phase 4 – Council Analysis
+      const councilConfig = getCouncilConfig();
+      const councilDeps = {
+        toolDeps: {
+          graphRag: service,
+          neo4j: service.neo4j,
+          qdrant: service.qdrant,
+          repoId,
+        },
+        qdrant: service.qdrant,
+        embedFn: service.embedFn,
+      };
+
+      const councilReport = await runCouncil(
+        manifest,
+        triage,
+        repoId,
+        councilConfig,
+        councilDeps,
+      );
+
+      res.status(200).json({
+        success: true,
+        data: {
+          manifest: {
+            jobId: manifest.jobId,
+            primaryLanguage: manifest.fingerprint.primaryLanguage,
+            fileCount: manifest.targetFiles.length,
+            dependencyRisks: manifest.dependencyRisks.length,
+          },
+          triageSummary: {
+            chunkCount: triage.chunks.length,
+            fileCount: new Set(triage.chunks.map((c) => c.filePath)).size,
+          },
+          councilReport,
+        },
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(
+        "Server",
+        `Council analysis failed for jobId=${jobId}: ${message}`,
+      );
+      res
+        .status(500)
+        .json({ success: false, error: "Council Analysis Failed", message });
+    }
+  },
+);
+
 // ── Start ────────────────────────────────────────────────────────────────────
 app.listen(Number(PORT), () => {
   logger.info(
@@ -439,6 +622,10 @@ app.listen(Number(PORT), () => {
     `   POST /api/v1/graph-rag/search  { query, repoId, topK?, maxDepth?, ranked? }`,
   );
   logger.info("Server", `   DELETE /api/v1/graph-rag/repo  { repoId }`);
+  logger.info(
+    "Server",
+    `   POST /api/v1/council/analyse   { repoUrl, repoId?, jobId? }`,
+  );
   logger.info("Server", `   GET  /health`);
 });
 
