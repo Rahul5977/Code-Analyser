@@ -13,6 +13,15 @@ import { ingestRepository } from "./ingestors";
 import { parseAndTriage } from "./parsers";
 import { GraphRagService } from "./graph-rag";
 import { runCouncil } from "./council";
+import {
+  analyzeRepo,
+  streamProgress,
+  compareReports,
+  getReportEndpoint,
+  createAnalysisWorker,
+  closePubSub,
+  closeQueue,
+} from "./delivery";
 import { logger } from "./utils/logger";
 import type {
   GraphRagConfig,
@@ -604,15 +613,38 @@ app.post(
   },
 );
 
+// ─── Phase 5: API Delivery Routes ────────────────────────────────────────────
+
+app.post("/api/repo/analyze", analyzeRepo);
+app.get("/api/repo/stream/:jobId", streamProgress);
+app.get("/api/repo/diff", compareReports);
+app.get("/api/repo/report/:jobId", getReportEndpoint);
+
+// ─── BullMQ Worker (optional — start only if ENABLE_WORKER=true) ─────────────
+//
+// In production the worker typically runs as a separate process.  Setting
+// ENABLE_WORKER=true starts it in-process for development convenience.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let analysisWorker: ReturnType<typeof createAnalysisWorker> | null = null;
+
+if (process.env["ENABLE_WORKER"] === "true") {
+  analysisWorker = createAnalysisWorker();
+}
+
 // ── Start ────────────────────────────────────────────────────────────────────
 app.listen(Number(PORT), () => {
   logger.info(
     "Server",
     `🚀 Code Analyser Service listening on http://localhost:${PORT}`,
   );
+  logger.info("Server", "");
+  logger.info("Server", "  Phase 1–2 (Ingest & Triage):");
   logger.info("Server", `   POST /api/v1/ingest   { repoUrl, jobId? }`);
   logger.info("Server", `   POST /api/v1/triage   { filePaths, repoRoot }`);
   logger.info("Server", `   POST /api/v1/analyse  { repoUrl, jobId? }`);
+  logger.info("Server", "");
+  logger.info("Server", "  Phase 3 (GraphRAG):");
   logger.info(
     "Server",
     `   POST /api/v1/graph-rag/sync    { repoUrl, repoId?, jobId? }`,
@@ -622,19 +654,45 @@ app.listen(Number(PORT), () => {
     `   POST /api/v1/graph-rag/search  { query, repoId, topK?, maxDepth?, ranked? }`,
   );
   logger.info("Server", `   DELETE /api/v1/graph-rag/repo  { repoId }`);
+  logger.info("Server", "");
+  logger.info("Server", "  Phase 4 (Council):");
   logger.info(
     "Server",
     `   POST /api/v1/council/analyse   { repoUrl, repoId?, jobId? }`,
   );
+  logger.info("Server", "");
+  logger.info("Server", "  Phase 5 (Delivery):");
+  logger.info(
+    "Server",
+    `   POST /api/repo/analyze         { repoUrl, callbackUrl? }`,
+  );
+  logger.info("Server", `   GET  /api/repo/stream/:jobId   (SSE)`);
+  logger.info("Server", `   GET  /api/repo/diff?jobA=&jobB= (Report Diff)`);
+  logger.info("Server", `   GET  /api/repo/report/:jobId   (Fetch Report)`);
+  logger.info("Server", "");
   logger.info("Server", `   GET  /health`);
+  logger.info(
+    "Server",
+    `   Worker: ${analysisWorker ? "RUNNING (in-process)" : "DISABLED (set ENABLE_WORKER=true)"}`,
+  );
 });
 
 // ── Graceful Shutdown ────────────────────────────────────────────────────────
 const gracefulShutdown = async (signal: string): Promise<void> => {
   logger.info("Server", `Received ${signal} — shutting down gracefully…`);
+
+  // Phase 5 teardown
+  if (analysisWorker) {
+    await analysisWorker.close();
+  }
+  await closeQueue();
+  await closePubSub();
+
+  // Phase 3 teardown
   if (graphRagService) {
     await graphRagService.close();
   }
+
   process.exit(0);
 };
 
