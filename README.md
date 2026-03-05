@@ -55,6 +55,7 @@ CodeAnalyser/
 │
 ├── .env.example                          # ← Master env template (all 6 phases)
 ├── .gitignore
+├── docker-compose.yml                    # ← Redis + Qdrant + Neo4j (local dev)
 ├── README.md                             # ← This file
 │
 ├── server/                               # ═══ Node.js Backend ═══
@@ -177,12 +178,30 @@ CodeAnalyser/
 
 ### Prerequisites
 
-| Service      | Local Install                           | Purpose                |
-| ------------ | --------------------------------------- | ---------------------- |
-| Node.js ≥ 18 | `brew install node`                     | Runtime                |
-| Redis ≥ 7    | `brew install redis && redis-server`    | BullMQ queue + Pub/Sub |
-| Qdrant       | `docker run -p 6333:6333 qdrant/qdrant` | Vector DB (Phase 3)    |
-| Neo4j ≥ 5    | `docker run -p 7687:7687 neo4j:5`       | Graph DB (Phase 3)     |
+| Service      | How to Run                                                        | Purpose              |
+| ------------ | ----------------------------------------------------------------- | -------------------- |
+| Node.js ≥ 18 | `brew install node`                                               | Runtime              |
+| Docker       | [Docker Desktop](https://www.docker.com/products/docker-desktop/) | Infrastructure stack |
+
+### Start Infrastructure (Redis + Qdrant + Neo4j)
+
+```bash
+# From the project root — starts all 3 services in the background
+docker compose up -d
+
+# Verify everything is healthy
+docker compose ps
+```
+
+| Service | Endpoint                                | UI                                                                |
+| ------- | --------------------------------------- | ----------------------------------------------------------------- |
+| Redis   | `localhost:6379`                        | —                                                                 |
+| Qdrant  | `localhost:6333` (REST) / `6334` (gRPC) | [Dashboard](http://localhost:6333/dashboard)                      |
+| Neo4j   | `localhost:7687` (Bolt)                 | [Browser UI](http://localhost:7474) — login: `neo4j` / `password` |
+
+> **Tip:** Open http://localhost:7474 in your browser once the agents start mapping
+> repositories. Run a Cypher query like `MATCH (n) RETURN n LIMIT 50` to visually
+> inspect the Knowledge Graph of file dependencies and chunk relationships.
 
 ### Setup
 
