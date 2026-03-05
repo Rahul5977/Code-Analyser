@@ -54,48 +54,9 @@ interface AnalysisJobData {
   callbackUrl: string | null;
 }
 
-// ─── Stub LLM (mirrors src/index.ts — in production inject a real provider) ─
-
-const stubLlmFn: LLMCompletionFn = async (
-  messages: LLMMessage[],
-  _tools?: ToolDefinition[],
-  _temperature?: number,
-): Promise<LLMMessage> => {
-  const lastUserMsg = messages.filter((m) => m.role === "user").pop();
-  const content = lastUserMsg?.content ?? "";
-  const systemMsg = messages.find((m) => m.role === "system");
-  const isJsonRequest = systemMsg?.content.includes("JSON") ?? false;
-
-  if (isJsonRequest && content.includes("analysis plan")) {
-    return {
-      role: "assistant",
-      content: JSON.stringify({
-        securityTargets: [],
-        performanceTargets: [],
-        architectureScope: { focusModules: [] },
-        testCoverageEnabled: false,
-        crossReferences: [],
-      }),
-    };
-  }
-  if (isJsonRequest && content.includes("findings")) {
-    return { role: "assistant", content: "[]" };
-  }
-  if (isJsonRequest && content.includes("architectural")) {
-    return {
-      role: "assistant",
-      content: JSON.stringify({
-        circularDependencies: [],
-        couplingScores: [],
-        godClasses: [],
-        layerViolations: [],
-        detectedPattern: "Unknown",
-        summary: "Stub LLM — replace with a real provider for actual analysis.",
-      }),
-    };
-  }
-  return { role: "assistant", content: "Stub LLM response." };
-};
+// ─── Smart Stub LLM (imported from shared module) ────────────────────────────
+import { createSmartStubLlm } from "../council/smart-stub-llm";
+const stubLlmFn = createSmartStubLlm();
 
 // ─── Stub Embedding (mirrors src/index.ts) ───────────────────────────────────
 

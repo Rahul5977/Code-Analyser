@@ -27,10 +27,9 @@ import type {
   GraphRagConfig,
   EmbedFunction,
   EmbedBatchFunction,
-  LLMMessage,
-  LLMCompletionFn,
   CouncilConfig,
 } from "./interfaces";
+import { createSmartStubLlm } from "./council/smart-stub-llm";
 
 // ── Server Setup ──────────────────────────────────────────────────────────────
 const app = express();
@@ -104,66 +103,13 @@ const stubEmbedBatchFn: EmbedBatchFunction = async (
   return Promise.all(texts.map((t) => stubEmbedFn(t)));
 };
 
-// ─── Stub LLM Completion Function ───────────────────────────────────────────
+// ─── LLM Completion Function ─────────────────────────────────────────────────
 //
+// Uses the smart stub LLM that drives real tool chains when no API key is set.
 // In production, replace with a real LLM provider (OpenAI, Anthropic, etc.).
-// This stub simulates a basic LLM that returns a canned response.
-// It supports tool calls by returning a simple structured response.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const stubLlmFn: LLMCompletionFn = async (
-  messages: LLMMessage[],
-  _tools?: import("./interfaces").ToolDefinition[],
-  _temperature?: number,
-): Promise<LLMMessage> => {
-  // In production, replace this with:
-  //   const response = await openai.chat.completions.create({ messages, tools, temperature });
-  //
-  // This stub returns a basic response that allows the pipeline to complete.
-  const lastUserMsg = messages.filter((m) => m.role === "user").pop();
-  const content = lastUserMsg?.content ?? "";
-
-  // If the system prompt asks for JSON, return a minimal valid JSON response
-  const systemMsg = messages.find((m) => m.role === "system");
-  const isJsonRequest = systemMsg?.content.includes("JSON") ?? false;
-
-  if (isJsonRequest && content.includes("analysis plan")) {
-    return {
-      role: "assistant",
-      content: JSON.stringify({
-        securityTargets: [],
-        performanceTargets: [],
-        architectureScope: { focusModules: [] },
-        testCoverageEnabled: false,
-        crossReferences: [],
-      }),
-    };
-  }
-
-  if (isJsonRequest && content.includes("findings")) {
-    return { role: "assistant", content: "[]" };
-  }
-
-  if (isJsonRequest && content.includes("architectural")) {
-    return {
-      role: "assistant",
-      content: JSON.stringify({
-        circularDependencies: [],
-        couplingScores: [],
-        godClasses: [],
-        layerViolations: [],
-        detectedPattern: "Unknown",
-        summary: "Stub LLM — replace with a real provider for actual analysis.",
-      }),
-    };
-  }
-
-  return {
-    role: "assistant",
-    content:
-      "Stub LLM response. Replace with a real LLM provider (OpenAI, Anthropic, Ollama, etc.) for actual analysis.",
-  };
-};
+const stubLlmFn = createSmartStubLlm();
 
 /** Returns the default council configuration */
 function getCouncilConfig(): CouncilConfig {
