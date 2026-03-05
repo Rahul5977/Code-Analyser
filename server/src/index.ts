@@ -6,6 +6,11 @@
 // DELETE /api/v1/graph-rag/repo  →  { repoId }    →  OK
 // POST /api/v1/council/analyse   →  { repoUrl, repoId?, jobId? }  →  CouncilReport
 
+// ── Load environment variables from .env (must be first) ─────────────────────
+import { config as loadEnv } from "dotenv";
+import path from "path";
+loadEnv({ path: path.resolve(__dirname, "../.env") });
+
 import express, { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 
