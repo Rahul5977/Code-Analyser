@@ -190,6 +190,12 @@ export interface CoverageReport {
 export interface FindingCard {
   finding: Finding;
   fixedCode: string;
+  /** The narrow code window (vulnerable lines ± buffer) that was actually sent to the LLM for fixing */
+  vulnerableWindow?: {
+    code: string;
+    startLine: number;
+    endLine: number;
+  };
   explanations: {
     junior: string;
     senior: string;

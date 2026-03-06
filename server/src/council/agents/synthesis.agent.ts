@@ -18,6 +18,7 @@ import { executeReActLoop, type ReActConfig } from "../react-engine";
 import {
   createGenerateFixedCodeSnippetTool,
   createFetchDocumentationReferenceTool,
+  extractWindow,
 } from "../tools";
 import type {
   Finding,
@@ -36,9 +37,10 @@ TOOLS AVAILABLE
 ═══════════════════════════════════════════════════════════════
 
 1. \`generate_fixed_code_snippet\`
-   — Calls the LLM to produce a corrected version of the flagged code.
-   — The fix MUST be complete, compilable, and drop-in replaceable.
-   — Input: { "originalCode": "the vulnerable/inefficient code", "findingDescription": "what's wrong and how to fix it" }
+   — Generates a corrected version of ONLY the vulnerable code window (not the whole file).
+   — YOU MUST provide the vulnerability's exact startLine / endLine so the tool can extract a narrow ~20-line window.
+   — Input: { "originalCode": "full chunk code", "findingDescription": "...", "chunkStartLine": N, "vulnStartLine": N, "vulnEndLine": N, "language": "typescript" }
+   — The tool internally calls extractWindow() to isolate lines vulnStart-vulnEnd ± 10 lines of context.
 
 2. \`fetch_documentation_reference\`
    — Queries a curated documentation index (OWASP, CWE, MDN, Node.js docs, React docs) for authoritative references.
@@ -50,8 +52,14 @@ WORKFLOW (FOR EACH FINDING)
 
 **Step 1 — Generate Fix**
   Call \`generate_fixed_code_snippet\` with:
-  - The original vulnerable/inefficient code from the finding's codeSnippet
-  - A clear description of what's wrong and what the fix should achieve
+  - originalCode: the full chunk code from the finding's codeSnippet
+  - findingDescription: a clear description of what's wrong
+  - chunkStartLine: the finding's startLine (start of the chunk in the file)
+  - vulnStartLine: the EXACT start line of the specific vulnerability (from the finding)
+  - vulnEndLine: the EXACT end line of the specific vulnerability (from the finding)
+  - language: inferred from file extension
+
+  ⚠️ CRITICAL: Always pass vulnStartLine and vulnEndLine. The tool uses these to extract ONLY a ~20-line window around the vulnerability. Without them, the LLM tries to rewrite the entire chunk and fails.
 
 **Step 2 — Fetch References**
   Call \`fetch_documentation_reference\` with:
@@ -205,7 +213,11 @@ export async function runSynthesisAgent(
       task: "Generate FindingCards for these confirmed/plausible findings.",
       findings: findingSummaries,
       instructions:
-        "For EACH finding: 1) call generate_fixed_code_snippet, 2) call fetch_documentation_reference, " +
+        "For EACH finding: " +
+        "1) call generate_fixed_code_snippet with originalCode=codeSnippet, " +
+        "chunkStartLine=startLine, vulnStartLine=startLine, vulnEndLine=endLine, " +
+        "findingDescription=description. " +
+        "2) call fetch_documentation_reference with the relevant technology and concept. " +
         "3) write explanations at 3 levels. Return a JSON array of FindingCards.",
     });
 
@@ -261,11 +273,29 @@ function parseCards(
         : undefined;
       if (!finding) continue;
 
+      // Compute the narrow vulnerable window for the UI diff
+      let vulnerableWindow: FindingCard["vulnerableWindow"];
+      if (finding.codeSnippet && finding.startLine > 0 && finding.endLine > 0) {
+        const win = extractWindow(
+          finding.codeSnippet,
+          finding.startLine,
+          finding.startLine,
+          finding.endLine,
+          5,
+        );
+        vulnerableWindow = {
+          code: win.windowCode,
+          startLine: win.windowStartLine,
+          endLine: win.windowEndLine,
+        };
+      }
+
       cards.push({
         finding,
         fixedCode:
           entry.fixedCode ??
           "// Fix generation failed — please review manually.",
+        vulnerableWindow,
         explanations: {
           junior:
             entry.explanations?.junior ??

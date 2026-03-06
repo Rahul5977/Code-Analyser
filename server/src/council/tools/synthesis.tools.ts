@@ -2,8 +2,13 @@
 // src/council/tools/synthesis.tools.ts
 //
 // Synthesis / Pedagogical Agent Tools:
-//   1. generate_fixed_code_snippet — LLM-powered code fix generation
+//   1. generate_fixed_code_snippet — LLM-powered TARGETED code fix generation
 //   2. fetch_documentation_reference — curated docs index lookup
+//
+// ★ Key design choice: we NEVER send the full 500-line chunk to the LLM for
+//   fix generation.  Instead we use `extractWindow()` to isolate the exact
+//   vulnerable lines ± a configurable buffer (default 10 lines), send only
+//   that ~20-line window, and get back a focused, compilable fix.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type {
@@ -11,10 +16,56 @@ import type {
   LLMCompletionFn,
 } from "../../interfaces/council.interface";
 
+// ─── extractWindow — Surgical Code Windowing ─────────────────────────────────
+
+/**
+ * Extracts a narrow window of code around the vulnerable lines.
+ *
+ * @param code       The full chunk's source code.
+ * @param chunkStart The 1-based start line of the chunk in the original file.
+ * @param vulnStart  The 1-based start line of the vulnerability in the original file.
+ * @param vulnEnd    The 1-based end line of the vulnerability in the original file.
+ * @param buffer     Number of context lines above and below (default: 10).
+ * @returns          The extracted window with its absolute line range.
+ *
+ * Example:
+ *   Chunk covers lines 20-501 of EditListing.jsx.
+ *   Finding says the issue is on lines 45-55.
+ *   extractWindow(code, 20, 45, 55, 10)
+ *   → returns lines 35-65 of the file (lines 16-46 of the chunk), i.e., a 30-line window.
+ */
+export function extractWindow(
+  code: string,
+  chunkStart: number,
+  vulnStart: number,
+  vulnEnd: number,
+  buffer: number = 10,
+): { windowCode: string; windowStartLine: number; windowEndLine: number } {
+  const lines = code.split("\n");
+  const totalLines = lines.length;
+
+  // Convert absolute file lines → 0-based chunk-local indices
+  const localVulnStart = Math.max(0, vulnStart - chunkStart);
+  const localVulnEnd = Math.min(totalLines - 1, vulnEnd - chunkStart);
+
+  // Apply buffer, clamped to chunk bounds
+  const windowLocalStart = Math.max(0, localVulnStart - buffer);
+  const windowLocalEnd = Math.min(totalLines - 1, localVulnEnd + buffer);
+
+  const windowCode = lines
+    .slice(windowLocalStart, windowLocalEnd + 1)
+    .join("\n");
+  const windowStartLine = chunkStart + windowLocalStart;
+  const windowEndLine = chunkStart + windowLocalEnd;
+
+  return { windowCode, windowStartLine, windowEndLine };
+}
+
 // ─── generate_fixed_code_snippet ─────────────────────────────────────────────
 
 /**
- * Calls the LLM to produce a corrected version of flagged code.
+ * Generates a targeted fix for ONLY the vulnerable code window, not the
+ * entire chunk.  Prevents LLM token overflow and hallucination.
  */
 export function createGenerateFixedCodeSnippetTool(
   llmFn: LLMCompletionFn,
@@ -22,19 +73,38 @@ export function createGenerateFixedCodeSnippetTool(
   return {
     name: "generate_fixed_code_snippet",
     description:
-      "Generates a corrected version of flagged code based on a finding description. " +
-      "Returns the fixed code along with a diff summary of changes made.",
+      "Generates a corrected version of flagged code. IMPORTANT: Provide " +
+      "the vulnerability's exact startLine and endLine so the tool can " +
+      "extract only the relevant code window (~20 lines) for the LLM. " +
+      "Returns the fixed code window and its line range.",
     parameters: {
       type: "object",
       properties: {
         originalCode: {
           type: "string",
-          description: "The original vulnerable or problematic code.",
+          description:
+            "The full chunk source code. The tool will automatically extract " +
+            "a narrow window around the vulnerability.",
         },
         findingDescription: {
           type: "string",
           description:
-            "Description of the issue found and what needs to be fixed.",
+            "Description of the issue: what's wrong and how to fix it.",
+        },
+        chunkStartLine: {
+          type: "number",
+          description:
+            "The 1-based start line of the chunk in the original file.",
+        },
+        vulnStartLine: {
+          type: "number",
+          description:
+            "The 1-based start line of the specific vulnerability in the original file.",
+        },
+        vulnEndLine: {
+          type: "number",
+          description:
+            "The 1-based end line of the specific vulnerability in the original file.",
         },
         language: {
           type: "string",
@@ -47,6 +117,9 @@ export function createGenerateFixedCodeSnippetTool(
       const originalCode = args["originalCode"] as string;
       const findingDescription = args["findingDescription"] as string;
       const language = (args["language"] as string) ?? "typescript";
+      const chunkStartLine = (args["chunkStartLine"] as number) ?? 1;
+      const vulnStartLine = (args["vulnStartLine"] as number) ?? 0;
+      const vulnEndLine = (args["vulnEndLine"] as number) ?? 0;
 
       if (!originalCode || !findingDescription) {
         return JSON.stringify({
@@ -55,20 +128,62 @@ export function createGenerateFixedCodeSnippetTool(
       }
 
       try {
+        // ── Determine what code to send to the LLM ──
+        // If the agent provided vulnerability line numbers, extract a narrow
+        // window.  Otherwise, if the whole chunk is small (≤60 lines), send
+        // it in full.  If it's large and we have no line numbers, truncate
+        // to the first 60 lines + a comment.
+        let codeForLLM: string;
+        let windowStartLine: number;
+        let windowEndLine: number;
+        const codeLines = originalCode.split("\n");
+
+        if (vulnStartLine > 0 && vulnEndLine > 0) {
+          // Targeted window extraction
+          const window = extractWindow(
+            originalCode,
+            chunkStartLine,
+            vulnStartLine,
+            vulnEndLine,
+            10,
+          );
+          codeForLLM = window.windowCode;
+          windowStartLine = window.windowStartLine;
+          windowEndLine = window.windowEndLine;
+        } else if (codeLines.length <= 60) {
+          // Small chunk — send in full
+          codeForLLM = originalCode;
+          windowStartLine = chunkStartLine;
+          windowEndLine = chunkStartLine + codeLines.length - 1;
+        } else {
+          // Large chunk with no line numbers — take first 60 lines as best effort
+          codeForLLM =
+            codeLines.slice(0, 60).join("\n") +
+            "\n// ... (remaining code omitted for brevity)";
+          windowStartLine = chunkStartLine;
+          windowEndLine = chunkStartLine + 59;
+        }
+
         const response = await llmFn(
           [
             {
               role: "system",
               content:
-                `You are a senior ${language} developer. Fix the code issue described below. ` +
-                "Return ONLY the corrected code in a single code block, followed by a brief " +
-                "summary of changes (2-3 sentences). No extra commentary.",
+                `You are a senior ${language} developer performing a surgical code fix.\n\n` +
+                "RULES:\n" +
+                "1. You are given ONLY the vulnerable code window (~10-30 lines), NOT the full file.\n" +
+                "2. Fix ONLY the specific issue described. Do NOT restructure or rewrite unrelated code.\n" +
+                "3. Your output MUST be a drop-in replacement for the window — same indentation, same structure.\n" +
+                "4. Return ONLY the fixed code in a single code block, then a 1-2 sentence summary.\n" +
+                "5. If the fix requires a new import, add a comment at the top: `// REQUIRES IMPORT: <import statement>`.\n" +
+                "6. Preserve all existing functionality that isn't part of the vulnerability.",
             },
             {
               role: "user",
               content:
-                `## Issue\n${findingDescription}\n\n## Original Code\n\`\`\`${language}\n${originalCode}\n\`\`\`\n\n` +
-                "Please provide the fixed code and a brief summary of changes.",
+                `## Issue (lines ${vulnStartLine || "?"}–${vulnEndLine || "?"} of original file)\n${findingDescription}\n\n` +
+                `## Code Window (lines ${windowStartLine}–${windowEndLine})\n\`\`\`${language}\n${codeForLLM}\n\`\`\`\n\n` +
+                "Provide the fixed code window and a brief summary of changes.",
             },
           ],
           undefined,
@@ -96,6 +211,11 @@ export function createGenerateFixedCodeSnippetTool(
             afterCodeBlock ||
             "Code has been updated to address the described issue.",
           language,
+          window: {
+            startLine: windowStartLine,
+            endLine: windowEndLine,
+            linesInWindow: codeForLLM.split("\n").length,
+          },
         });
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);

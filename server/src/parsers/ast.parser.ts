@@ -67,6 +67,14 @@ const TS_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
 /** Extensions that may contain JSX / React components */
 const REACT_EXTENSIONS = new Set([".tsx", ".jsx"]);
 
+/**
+ * Maximum lines a single chunk is allowed to have before it is logically
+ * split into sub-chunks.  This prevents 500-line React components from
+ * being sent as a single payload to the LLM, which causes token overflow,
+ * hallucination, and failed code-fix generation.
+ */
+const MAX_CHUNK_LINES = 100;
+
 // ─── Parser Singleton ────────────────────────────────────────────────────────
 // tree-sitter Parser is safe to reuse across files.
 
@@ -268,6 +276,100 @@ function containsJSX(node: SyntaxNode): boolean {
   return false;
 }
 
+// ─── Oversized Chunk Splitter ────────────────────────────────────────────────
+
+/**
+ * Splits a chunk that exceeds MAX_CHUNK_LINES into logically-bounded
+ * sub-chunks.  The algorithm:
+ *   1. Split the code into lines.
+ *   2. Walk line-by-line, tracking brace depth.
+ *   3. When the accumulated window exceeds MAX_CHUNK_LINES AND we're at
+ *      brace-depth 0 or 1 (a logical statement boundary), emit a sub-chunk
+ *      and start a new window.
+ *   4. If we can't find a clean boundary within 1.5× the threshold, force
+ *      a split at the threshold to guarantee bounded chunk sizes.
+ *
+ * Each sub-chunk retains the parent's AST metadata (complexity, smells, cfg)
+ * but gets its own unique chunk ID and accurate startLine/endLine.
+ */
+function splitOversizedChunk(chunk: ParsedChunk): ParsedChunk[] {
+  const lines = chunk.code.split("\n");
+
+  // Not oversized — return as-is
+  if (lines.length <= MAX_CHUNK_LINES) return [chunk];
+
+  const subChunks: ParsedChunk[] = [];
+  let windowStart = 0; // index into `lines`
+  let braceDepth = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+
+    // Track brace depth for logical boundary detection
+    for (const ch of line) {
+      if (ch === "{") braceDepth++;
+      if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
+    }
+
+    const windowLen = i - windowStart + 1;
+
+    // Conditions to emit a sub-chunk:
+    //   a) We've accumulated enough lines AND we're at a logical boundary
+    //   b) We've exceeded 1.5× the threshold — force split regardless
+    const atLogicalBoundary = braceDepth <= 1 && windowLen >= MAX_CHUNK_LINES;
+    const forceSplit = windowLen >= Math.floor(MAX_CHUNK_LINES * 1.5);
+
+    if ((atLogicalBoundary || forceSplit) && i < lines.length - 1) {
+      const subCode = lines.slice(windowStart, i + 1).join("\n");
+      const subStartLine = chunk.startLine + windowStart;
+      const subEndLine = chunk.startLine + i;
+
+      subChunks.push({
+        ...chunk,
+        id: computeChunkId(chunk.filePath, subStartLine, subCode),
+        code: subCode,
+        startLine: subStartLine,
+        endLine: subEndLine,
+        // Divide parent complexity proportionally for triage ordering
+        cyclomaticComplexity: Math.max(
+          1,
+          Math.round(chunk.cyclomaticComplexity * (windowLen / lines.length)),
+        ),
+      });
+
+      windowStart = i + 1;
+      braceDepth = 0; // reset for next window
+    }
+  }
+
+  // Emit the final window (always has content)
+  if (windowStart < lines.length) {
+    const subCode = lines.slice(windowStart).join("\n");
+    const subStartLine = chunk.startLine + windowStart;
+    const subEndLine = chunk.startLine + lines.length - 1;
+    const windowLen = lines.length - windowStart;
+
+    subChunks.push({
+      ...chunk,
+      id: computeChunkId(chunk.filePath, subStartLine, subCode),
+      code: subCode,
+      startLine: subStartLine,
+      endLine: subEndLine,
+      cyclomaticComplexity: Math.max(
+        1,
+        Math.round(chunk.cyclomaticComplexity * (windowLen / lines.length)),
+      ),
+    });
+  }
+
+  logger.debug(
+    LOG_CTX,
+    `  ✂ Split oversized chunk (${lines.length} lines) → ${subChunks.length} sub-chunks`,
+  );
+
+  return subChunks;
+}
+
 // ─── Single File Processing ──────────────────────────────────────────────────
 
 interface FileParseResult {
@@ -370,7 +472,20 @@ async function processFile(
     };
   });
 
-  return { chunks, rawImports, resolvedDeps };
+  // ── 5. Split any oversized chunks that still exceed MAX_CHUNK_LINES ──
+  // After inner-function extraction, some parent components may still be large
+  // (e.g., a component with lots of JSX but no extracted inner functions).
+  // Split them into bounded sub-chunks so the LLM never receives a 500-line payload.
+  const boundedChunks = chunks.flatMap(splitOversizedChunk);
+
+  if (boundedChunks.length !== chunks.length) {
+    logger.debug(
+      LOG_CTX,
+      `${path.relative(repoRoot, filePath)}: ${chunks.length} chunks → ${boundedChunks.length} after oversized splitting`,
+    );
+  }
+
+  return { chunks: boundedChunks, rawImports, resolvedDeps };
 }
 
 // ─── Main Export ─────────────────────────────────────────────────────────────

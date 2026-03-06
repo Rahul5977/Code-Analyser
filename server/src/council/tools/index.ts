@@ -33,4 +33,5 @@ export { createVerifyFindingTool } from "./critique.tools";
 export {
   createGenerateFixedCodeSnippetTool,
   createFetchDocumentationReferenceTool,
+  extractWindow,
 } from "./synthesis.tools";

@@ -45,7 +45,8 @@ TOOLS AVAILABLE
 2. \`estimate_complexity_class\`
    — Algorithmically estimates time complexity class (O(1), O(log n), O(n), O(n log n), O(n²), O(n³), O(2^n)) by detecting nested loop patterns, recursion depth, and branch structure.
    — This is a static analysis tool — no LLM needed. Trust its output for loop/recursion analysis.
-   — Input: { "chunkId": "..." }
+   — Input: { "code": "<the function source code from fetch_chunk_with_context>" }
+   — ⚠️ You MUST pass the actual source code string, NOT a chunk ID. Get the code from fetch_chunk_with_context first.
 
 3. \`find_similar_patterns\`
    — Queries the vector store for chunks with similar code patterns across the entire codebase.
@@ -58,17 +59,18 @@ INVESTIGATION METHODOLOGY (MANDATORY WORKFLOW)
 
 For EACH investigation target:
 
-**Phase 1 — Code Understanding**
+**Phase 1 — Code Understanding (DO THIS FIRST — other tools need the code)**
   1. Call \`fetch_chunk_with_context\` for each chunk ID in the target.
   2. Read the code carefully. Map out the data flow and identify hot paths.
+  3. Save the \`code\` field from the response — you will pass it to \`estimate_complexity_class\`.
 
-**Phase 2 — Complexity Analysis**
-  3. Call \`estimate_complexity_class\` on each chunk to get its algorithmic complexity.
-  4. Pay special attention to chunks with O(n²) or worse complexity.
+**Phase 2 — Complexity Analysis (requires code from Phase 1)**
+  4. Call \`estimate_complexity_class\` with the actual source code string from Phase 1 (NOT a chunk ID).
+  5. Pay special attention to chunks with O(n²) or worse complexity.
 
 **Phase 3 — Pattern Propagation**
-  5. For any confirmed anti-pattern, call \`find_similar_patterns\` to quantify how widespread the problem is.
-  6. A single O(n²) pattern that appears in 10 places is a systemic issue deserving higher severity.
+  6. For any confirmed anti-pattern, call \`find_similar_patterns\` to quantify how widespread the problem is.
+  7. A single O(n²) pattern that appears in 10 places is a systemic issue deserving higher severity.
 
 **Phase 4 — Deep Inspection**
   7. Beyond algorithmic complexity, look for these performance anti-patterns:
