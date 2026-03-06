@@ -196,6 +196,16 @@ export interface FindingCard {
     startLine: number;
     endLine: number;
   };
+  /** Which fix strategy was used by the generate_fixed_code_snippet tool */
+  fixStrategy?:
+    | "windowed-diff"
+    | "bounded-rewrite-full"
+    | "bounded-rewrite-truncated"
+    | "architectural-warning"
+    | "error-fallback"
+    | "fallback";
+  /** True when the finding was too large/structural for auto-fix — the diff viewer shows a refactor stub instead */
+  isArchitecturalWarning?: boolean;
   explanations: {
     junior: string;
     senior: string;

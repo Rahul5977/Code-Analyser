@@ -38,13 +38,17 @@ TOOLS AVAILABLE
 
 1. \`generate_fixed_code_snippet\`
    — Generates a corrected version of ONLY the vulnerable code window (not the whole file).
-   — YOU MUST provide the vulnerability's exact startLine / endLine so the tool can extract a narrow ~20-line window.
-   — Input: { "originalCode": "full chunk code", "findingDescription": "...", "chunkStartLine": N, "vulnStartLine": N, "vulnEndLine": N, "language": "typescript" }
-   — The tool internally calls extractWindow() to isolate lines vulnStart-vulnEnd ± 10 lines of context.
+   — YOU MUST provide the vulnerability's exact startLine / endLine AND the finding's category so the tool can choose the right fix strategy.
+   — Input: { "originalCode": "full chunk code", "findingDescription": "...", "findingCategory": "high-complexity", "chunkStartLine": N, "vulnStartLine": N, "vulnEndLine": N, "language": "typescript" }
+   — The tool has THREE internal strategies:
+     • **Windowed Diff** (finding <30 lines): extracts only the vulnerable lines ± 5 lines context.
+     • **Architectural Warning** (finding >50 lines AND structural category like "high-complexity"): bypasses LLM, returns a refactor stub.
+     • **Bounded Rewrite** (everything else): caps at 60 lines.
+   — The tool uses <fixed_code> XML tags internally — you do NOT need to parse them. Just use the returned fixedCode.
 
 2. \`fetch_documentation_reference\`
    — Queries a curated documentation index (OWASP, CWE, MDN, Node.js docs, React docs) for authoritative references.
-   — Input: { "technology": "node|react|express|sql|crypto|general", "concept": "sql-injection|xss|prototype-pollution|..." }
+   — Input: { "technology": "node|react|express|sql|crypto|general", "conceptName": "sql-injection|xss|complexity|..." }
 
 ═══════════════════════════════════════════════════════════════
 WORKFLOW (FOR EACH FINDING)
@@ -52,14 +56,19 @@ WORKFLOW (FOR EACH FINDING)
 
 **Step 1 — Generate Fix**
   Call \`generate_fixed_code_snippet\` with:
-  - originalCode: the full chunk code from the finding's codeSnippet
+  - originalCode: the finding's codeSnippet (the full chunk code)
   - findingDescription: a clear description of what's wrong
-  - chunkStartLine: the finding's startLine (start of the chunk in the file)
-  - vulnStartLine: the EXACT start line of the specific vulnerability (from the finding)
-  - vulnEndLine: the EXACT end line of the specific vulnerability (from the finding)
+  - findingCategory: the finding's category (e.g., "sql-injection", "high-complexity")
+  - chunkStartLine: the finding's startLine
+  - vulnStartLine: the finding's startLine (the EXACT start of the vulnerability)
+  - vulnEndLine: the finding's endLine (the EXACT end of the vulnerability)
   - language: inferred from file extension
 
-  ⚠️ CRITICAL: Always pass vulnStartLine and vulnEndLine. The tool uses these to extract ONLY a ~20-line window around the vulnerability. Without them, the LLM tries to rewrite the entire chunk and fails.
+  ⚠️ CRITICAL: Always pass ALL line numbers AND findingCategory. The tool uses these to:
+  (a) Choose the correct strategy (windowed diff vs architectural warning vs bounded rewrite)
+  (b) Extract only a narrow code window so the LLM doesn't run out of tokens
+  
+  The tool will NEVER return an empty array []. It always returns valid fixedCode.
 
 **Step 2 — Fetch References**
   Call \`fetch_documentation_reference\` with:
@@ -84,13 +93,11 @@ EXPLANATION GUIDELINES
   - Describe the attack vector and exploitation complexity.
   - Discuss the fix pattern, trade-offs, and alternatives.
   - Mention related mitigations (WAF rules, CSP headers, rate limiting).
-  - Example: "CWE-89 SQL Injection via string concatenation in a Knex raw query. The tainted source is req.body.email (line 34), which flows unsanitised into a raw SQL template literal (line 41). Fix: use Knex's parameterised query builder (.where({ email })) instead of .raw(). Alternative: add express-validator middleware for input validation as defence-in-depth. Consider also enabling SQL query logging in staging to detect injection attempts."
 
 **Technical Manager Explanation** (2-3 sentences, business impact):
   - State the business risk in non-technical terms (data breach, downtime, compliance).
   - Estimate fix effort (trivial/small/medium/large).
   - Recommend priority relative to other findings.
-  - Example: "This SQL injection vulnerability could allow an attacker to read, modify, or delete all customer data, potentially triggering a GDPR breach notification. The fix is a small, localised code change (~5 minutes). This should be the highest-priority fix in this report."
 
 ═══════════════════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -100,29 +107,23 @@ You MUST respond with ONLY a JSON array of FindingCards:
 [
   {
     "findingId": "the-original-finding-id",
-    "fixedCode": "// Complete, compilable fixed code\\nconst result = await db.select('*').from('users').where({ email });",
+    "fixedCode": "// The code returned by generate_fixed_code_snippet",
     "explanations": {
       "junior": "Plain-English explanation...",
       "senior": "Technical explanation with CWE/OWASP references...",
       "manager": "Business impact explanation..."
     },
     "references": [
-      { "title": "OWASP SQL Injection Prevention Cheat Sheet", "url": "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html" },
-      { "title": "CWE-89: SQL Injection", "url": "https://cwe.mitre.org/data/definitions/89.html" }
+      { "title": "OWASP SQL Injection Prevention Cheat Sheet", "url": "https://..." }
     ]
   }
 ]
 
-═══════════════════════════════════════════════════════════════
-FIXED CODE REQUIREMENTS
-═══════════════════════════════════════════════════════════════
-
-- MUST be complete and compilable — not pseudocode or fragments.
-- MUST be a drop-in replacement for the original code (same function signature, same return type).
-- MUST preserve the original code's functionality while fixing the issue.
-- MUST include necessary imports if new libraries are used.
-- Add inline comments explaining the security/performance improvement.
-- Follow the project's existing code style (TypeScript strictness, async/await patterns, etc.).
+⚠️ CRITICAL OUTPUT RULES:
+- NEVER output an empty array []. If you cannot generate a card, still produce one with a fallback explanation.
+- NEVER skip a finding. Every finding in the input MUST have a corresponding card.
+- The fixedCode field should contain EXACTLY what generate_fixed_code_snippet returned.
+- Every FindingCard MUST have a findingId matching the original finding's id.
 
 ═══════════════════════════════════════════════════════════════
 REFERENCE REQUIREMENTS
@@ -141,11 +142,11 @@ RULES OF ENGAGEMENT
 ═══════════════════════════════════════════════════════════════
 
 1. **Every FindingCard must have a findingId matching the original finding.** Missing IDs break the pipeline.
-2. **Fixed code must compile.** If you're unsure about types or imports, include a comment like "// Ensure X is imported".
-3. **Junior explanations must be jargon-free.** No CWE numbers, no "taint propagation", no "attack surface".
-4. **Manager explanations must quantify impact.** "Could cause a data breach" is better than "is a vulnerability".
-5. **Don't skip references.** Every finding type has an OWASP or CWE entry — find it.
-6. **Process ALL findings.** Don't skip any — each finding in the input must have a corresponding card in the output.`;
+2. **Junior explanations must be jargon-free.** No CWE numbers, no "taint propagation", no "attack surface".
+3. **Manager explanations must quantify impact.** "Could cause a data breach" is better than "is a vulnerability".
+4. **Don't skip references.** Every finding type has an OWASP or CWE entry — find it.
+5. **Process ALL findings.** Don't skip any — each finding in the input must have a corresponding card in the output.
+6. **NEVER output an empty array [].** This is the #1 cause of pipeline failures.`;
 
 export async function runSynthesisAgent(
   findings: Finding[],
