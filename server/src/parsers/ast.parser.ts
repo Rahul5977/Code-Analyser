@@ -6,6 +6,9 @@
 // Pipeline (per file):
 //   1. Read source → parse with tree-sitter (TS grammar)
 //   2. Extract all function/method/arrow nodes as discrete chunks
+//      ★ Inner functions in React components (.jsx/.tsx) are extracted as
+//        separate chunks; the parent component chunk has inner bodies replaced
+//        with placeholder comments so analysis doesn't double-count code.
 //   3. For each chunk:
 //      a. Compute Cyclomatic Complexity & CFG
 //      b. Compute Halstead Volume
@@ -60,6 +63,9 @@ const EXTRACTABLE_NODE_TYPES = new Set([
 
 /** File extensions parsed with the TypeScript grammar (covers JS too) */
 const TS_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+
+/** Extensions that may contain JSX / React components */
+const REACT_EXTENSIONS = new Set([".tsx", ".jsx"]);
 
 // ─── Parser Singleton ────────────────────────────────────────────────────────
 // tree-sitter Parser is safe to reuse across files.
@@ -124,29 +130,142 @@ function extractFunctionName(node: SyntaxNode): string {
   return "<anonymous>";
 }
 
-// ─── AST Walker: Extract Function Nodes ──────────────────────────────────────
+// ─── Inner-function-aware AST Walker ─────────────────────────────────────────
 
 /**
- * Recursively walks the AST and collects all function/method nodes.
- * Returns them as a flat array (including nested functions).
+ * A node paired with the list of its direct inner function children, so
+ * the parent's code can be de-duplicated.
  */
-function extractFunctionNodes(rootNode: SyntaxNode): SyntaxNode[] {
-  const functions: SyntaxNode[] = [];
+interface FunctionNodeEntry {
+  node: SyntaxNode;
+  /** Direct child function nodes (one level deep) */
+  innerFunctions: SyntaxNode[];
+  /** The parent function node, if this is an inner function */
+  parentNode: SyntaxNode | null;
+}
 
-  function walk(node: SyntaxNode): void {
+/**
+ * Recursively walks the AST and collects all function/method nodes,
+ * recording parent→child relationships so inner functions can be
+ * extracted separately and the parent chunk can have its body de-duped.
+ */
+function extractFunctionNodesWithHierarchy(
+  rootNode: SyntaxNode,
+): FunctionNodeEntry[] {
+  const entries: FunctionNodeEntry[] = [];
+  /** Map from node id → entry for quick parent lookup */
+  const entryMap = new Map<number, FunctionNodeEntry>();
+
+  function walk(node: SyntaxNode, parentFn: SyntaxNode | null): void {
     if (EXTRACTABLE_NODE_TYPES.has(node.type)) {
-      functions.push(node);
-      // Still recurse into children to catch nested functions
+      const entry: FunctionNodeEntry = {
+        node,
+        innerFunctions: [],
+        parentNode: parentFn,
+      };
+      entries.push(entry);
+      entryMap.set(node.id, entry);
+
+      // Register this node as an inner function of its parent
+      if (parentFn) {
+        const parentEntry = entryMap.get(parentFn.id);
+        if (parentEntry) {
+          parentEntry.innerFunctions.push(node);
+        }
+      }
+
+      // Recurse into children with this node as the new parent function
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child) walk(child, node);
+      }
+      return; // don't fall through to generic child walk
     }
 
+    // Non-function node: keep walking with the same parent function
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
-      if (child) walk(child);
+      if (child) walk(child, parentFn);
     }
   }
 
-  walk(rootNode);
-  return functions;
+  walk(rootNode, null);
+  return entries;
+}
+
+/**
+ * Given a parent function's source code and its inner function nodes,
+ * replace each inner function body with a placeholder comment.
+ *
+ * This ensures the parent chunk only contains its own logic + signatures
+ * of the inner functions, not their full bodies.
+ */
+function deduplicateParentCode(
+  parentNode: SyntaxNode,
+  innerFunctions: SyntaxNode[],
+  sourceCode: string,
+): string {
+  if (innerFunctions.length === 0) return parentNode.text;
+
+  // Work in the file-coordinate space, then extract the parent range
+  const parentStart = parentNode.startIndex;
+  const parentEnd = parentNode.endIndex;
+  let parentCode = sourceCode.slice(parentStart, parentEnd);
+
+  // Sort inner functions by their offset within the parent (descending) so
+  // that replacements don't shift earlier offsets
+  const sorted = [...innerFunctions].sort(
+    (a, b) => b.startIndex - a.startIndex,
+  );
+
+  for (const inner of sorted) {
+    const innerStart = inner.startIndex - parentStart;
+    const innerEnd = inner.endIndex - parentStart;
+    if (innerStart < 0 || innerEnd > parentCode.length) continue;
+
+    const name = extractFunctionName(inner);
+    const placeholder = `/* [inner function: ${name}] — extracted as separate chunk */`;
+    parentCode =
+      parentCode.slice(0, innerStart) +
+      placeholder +
+      parentCode.slice(innerEnd);
+  }
+
+  return parentCode;
+}
+
+// ─── React Component Detection ───────────────────────────────────────────────
+
+/**
+ * Heuristic: returns true if the function node likely represents a React
+ * component (returns JSX, or its name starts with an uppercase letter).
+ */
+function isLikelyReactComponent(node: SyntaxNode, ext: string): boolean {
+  if (!REACT_EXTENSIONS.has(ext)) return false;
+
+  const name = extractFunctionName(node);
+
+  // React convention: component names start with uppercase
+  if (name !== "<anonymous>" && /^[A-Z]/.test(name)) return true;
+
+  // Check if the function body contains a jsx_element or jsx_fragment return
+  return containsJSX(node);
+}
+
+/** Recursively check if a node contains any JSX elements */
+function containsJSX(node: SyntaxNode): boolean {
+  if (
+    node.type === "jsx_element" ||
+    node.type === "jsx_self_closing_element" ||
+    node.type === "jsx_fragment"
+  ) {
+    return true;
+  }
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child && containsJSX(child)) return true;
+  }
+  return false;
 }
 
 // ─── Single File Processing ──────────────────────────────────────────────────
@@ -159,7 +278,10 @@ interface FileParseResult {
 
 /**
  * Parses a single source file and extracts all function chunks with
- * full metrics.
+ * full metrics.  For React files (.tsx/.jsx), inner functions within
+ * components are extracted as their own chunks, and the parent component
+ * chunk has the inner bodies replaced with placeholders to avoid
+ * double-counting code.
  */
 async function processFile(
   filePath: string,
@@ -184,21 +306,30 @@ async function processFile(
   const fileDir = path.dirname(filePath);
   const resolvedDeps = resolveImports(rawImports, fileDir, repoRoot);
 
-  // ── 3. Extract all function/method nodes ──
-  const functionNodes = extractFunctionNodes(tree.rootNode);
+  // ── 3. Extract function nodes with parent/child hierarchy ──
+  const functionEntries = extractFunctionNodesWithHierarchy(tree.rootNode);
+
+  const isReactFile = REACT_EXTENSIONS.has(ext);
 
   logger.debug(
     LOG_CTX,
-    `${path.relative(repoRoot, filePath)}: ${functionNodes.length} functions, ${rawImports.length} imports`,
+    `${path.relative(repoRoot, filePath)}: ${functionEntries.length} functions (react=${isReactFile}), ${rawImports.length} imports`,
   );
 
   // ── 4. Build a ParsedChunk for each function ──
-  const chunks: ParsedChunk[] = functionNodes.map((fnNode) => {
-    const code = fnNode.text;
+  const chunks: ParsedChunk[] = functionEntries.map((entry) => {
+    const { node: fnNode, innerFunctions, parentNode } = entry;
+
+    // Determine code: if this node has inner functions, de-duplicate
+    const hasInnerFns = innerFunctions.length > 0;
+    const code = hasInnerFns
+      ? deduplicateParentCode(fnNode, innerFunctions, source)
+      : fnNode.text;
+
     const startLine = fnNode.startPosition.row + 1; // tree-sitter is 0-based
     const endLine = fnNode.endPosition.row + 1;
 
-    // 4a. Cyclomatic complexity & CFG
+    // 4a. Cyclomatic complexity & CFG (use original node for accurate analysis)
     const { cyclomaticComplexity, cfg } = computeCfgAndComplexity(fnNode);
 
     // 4b. Halstead volume
@@ -211,9 +342,17 @@ async function processFile(
     const id = computeChunkId(filePath, startLine, code);
 
     const name = extractFunctionName(fnNode);
+    const isReactComp = isReactFile && isLikelyReactComponent(fnNode, ext);
+    const isInner = parentNode !== null;
+
     logger.debug(
       LOG_CTX,
-      `  → ${name}  lines=${startLine}-${endLine}  CC=${cyclomaticComplexity}  HV=${halstead.volume}  smells=${smells.length}`,
+      `  → ${name}  lines=${startLine}-${endLine}  CC=${cyclomaticComplexity}  HV=${halstead.volume}  smells=${smells.length}` +
+        (isReactComp ? "  [React Component]" : "") +
+        (isInner ? "  [inner function]" : "") +
+        (hasInnerFns
+          ? `  [${innerFunctions.length} inner fn(s) extracted]`
+          : ""),
     );
 
     return {
