@@ -1,18 +1,12 @@
-// ─────────────────────────────────────────────────────────────────────────────
 // src/graph-rag/qdrant.store.ts
 //
-// Qdrant Vector Storage Layer.
+// Qdrant Vector Storage Layer — encapsulates all Qdrant interactions.
 //
-// Responsibilities:
-//   1. Collection lifecycle (create/ensure exists)
-//   2. Upserting chunk vectors with rich payloads
-//   3. Semantic similarity search (filtered by repoId)
-//   4. Retrieving stored hashes for the diff engine
-//   5. Deleting stale chunks
-//
-// All Qdrant interactions are encapsulated here — the GraphRagService
-// only talks to this class, never directly to the Qdrant client.
-// ─────────────────────────────────────────────────────────────────────────────
+// Provides: collection lifecycle, chunk upsert with embeddings, semantic
+// similarity search (filtered by repoId), stored-hash retrieval for the
+// diff engine, stale-chunk deletion, bulk filter-based repo deletion,
+// and full collection teardown.  The GraphRagService talks exclusively
+// to this class — never to the Qdrant client directly.
 
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { logger } from "../utils/logger";
@@ -25,8 +19,6 @@ import type {
 } from "../interfaces/graph-rag.interface";
 
 const LOG_CTX = "QdrantStore";
-
-// ── Batch size for upsert operations (Qdrant recommends ≤100 per call) ───────
 const UPSERT_BATCH_SIZE = 64;
 
 export class QdrantStore {
@@ -40,27 +32,16 @@ export class QdrantStore {
     collectionName: string = "code_chunks",
     apiKey?: string,
   ) {
-    this.client = new QdrantClient({
-      url,
-      apiKey,
-      checkCompatibility: false,
-    });
+    this.client = new QdrantClient({ url, apiKey, checkCompatibility: false });
     this.collectionName = collectionName;
     this.embeddingDimension = embeddingDimension;
   }
 
-  // ─── Collection Lifecycle ──────────────────────────────────────────────────
-
-  /**
-   * Ensures the collection exists with the correct vector config.
-   * Uses `collectionExists` check first to avoid errors on re-runs.
-   */
   async ensureCollection(): Promise<void> {
     try {
       const { exists } = await this.client.collectionExists(
         this.collectionName,
       );
-
       if (exists) {
         logger.debug(
           LOG_CTX,
@@ -70,19 +51,11 @@ export class QdrantStore {
       }
 
       await this.client.createCollection(this.collectionName, {
-        vectors: {
-          size: this.embeddingDimension,
-          distance: "Cosine",
-        },
-        // Optimisers: keep the index in memory for fast search
-        optimizers_config: {
-          memmap_threshold: 20000,
-        },
-        // Enable payload indexing for filtered search
+        vectors: { size: this.embeddingDimension, distance: "Cosine" },
+        optimizers_config: { memmap_threshold: 20000 },
         on_disk_payload: false,
       });
 
-      // Create payload indices for the fields we filter on
       await this.client.createPayloadIndex(this.collectionName, {
         field_name: "repoId",
         field_schema: "keyword",
@@ -106,14 +79,6 @@ export class QdrantStore {
     }
   }
 
-  // ─── Hash Retrieval (for Diff Engine) ──────────────────────────────────────
-
-  /**
-   * Retrieves all stored chunk hashes for a given repoId.
-   * Returns a Map<chunkId, hash> used by the diff engine.
-   *
-   * Uses scroll API to handle repos with >10k chunks.
-   */
   async getStoredHashes(repoId: string): Promise<Map<string, string>> {
     const hashes = new Map<string, string>();
 
@@ -123,12 +88,8 @@ export class QdrantStore {
 
       while (hasMore) {
         const response = await this.client.scroll(this.collectionName, {
-          filter: {
-            must: [{ key: "repoId", match: { value: repoId } }],
-          },
-          with_payload: {
-            include: ["chunkId", "hash"],
-          },
+          filter: { must: [{ key: "repoId", match: { value: repoId } }] },
+          with_payload: { include: ["chunkId", "hash"] },
           with_vector: false,
           limit: 1000,
           ...(offset !== undefined ? { offset } : {}),
@@ -142,7 +103,6 @@ export class QdrantStore {
           }
         }
 
-        // Qdrant scroll returns next_page_offset when there are more pages
         const rawOffset = response.next_page_offset;
         offset =
           typeof rawOffset === "string" || typeof rawOffset === "number"
@@ -156,7 +116,6 @@ export class QdrantStore {
         `Retrieved ${hashes.size} stored hashes for repo="${repoId}"`,
       );
     } catch (err: unknown) {
-      // If collection doesn't exist yet, return empty (first run)
       logger.warn(
         LOG_CTX,
         `Could not retrieve stored hashes: ${err instanceof Error ? err.message : String(err)}`,
@@ -166,16 +125,6 @@ export class QdrantStore {
     return hashes;
   }
 
-  // ─── Upsert ────────────────────────────────────────────────────────────────
-
-  /**
-   * Embeds and upserts an array of chunks into Qdrant.
-   *
-   * @param chunks      - The chunks to upsert (new or updated).
-   * @param repoId      - Repository identifier for filtering.
-   * @param embedFn     - Single-text embedding function.
-   * @param embedBatchFn - Optional batch embedding function for efficiency.
-   */
   async upsertChunks(
     chunks: ParsedChunk[],
     repoId: string,
@@ -189,30 +138,24 @@ export class QdrantStore {
 
     logger.info(LOG_CTX, `Upserting ${chunks.length} chunks into Qdrant…`);
 
-    // Process in batches to avoid overwhelming the embedding API and Qdrant
     for (let i = 0; i < chunks.length; i += UPSERT_BATCH_SIZE) {
       const batch = chunks.slice(i, i + UPSERT_BATCH_SIZE);
       const batchNum = Math.floor(i / UPSERT_BATCH_SIZE) + 1;
       const totalBatches = Math.ceil(chunks.length / UPSERT_BATCH_SIZE);
-
       logger.debug(
         LOG_CTX,
         `  Batch ${batchNum}/${totalBatches} (${batch.length} chunks)`,
       );
 
-      // ── Generate embeddings ──
-      // Build a summary text for each chunk that captures semantics
       const texts = batch.map((c) => buildEmbeddingText(c));
 
       let embeddings: number[][];
       if (embedBatchFn) {
         embeddings = await embedBatchFn(texts);
       } else {
-        // Fallback: sequential single-embed calls
         embeddings = await Promise.all(texts.map((t) => embedFn(t)));
       }
 
-      // ── Build Qdrant points ──
       const points = batch.map((chunk, idx) => {
         const payload: QdrantChunkPayload = {
           chunkId: chunk.id,
@@ -229,32 +172,18 @@ export class QdrantStore {
         };
 
         return {
-          // Qdrant expects string or integer IDs; use the chunk's SHA-based ID
           id: deterministicPointId(chunk.id),
           vector: embeddings[idx]!,
           payload: payload as unknown as Record<string, unknown>,
         };
       });
 
-      await this.client.upsert(this.collectionName, {
-        wait: true,
-        points,
-      });
+      await this.client.upsert(this.collectionName, { wait: true, points });
     }
 
     logger.info(LOG_CTX, `Upsert complete: ${chunks.length} chunks stored`);
   }
 
-  // ─── Search ────────────────────────────────────────────────────────────────
-
-  /**
-   * Semantic similarity search.
-   *
-   * @param queryVector - The embedded query vector.
-   * @param repoId      - Filter results to this repository.
-   * @param topK        - Number of results to return.
-   * @returns           Array of ParsedChunk-like objects reconstructed from payloads.
-   */
   async search(
     queryVector: number[],
     repoId: string,
@@ -268,12 +197,10 @@ export class QdrantStore {
     const results = await this.client.search(this.collectionName, {
       vector: queryVector,
       limit: topK,
-      filter: {
-        must: [{ key: "repoId", match: { value: repoId } }],
-      },
+      filter: { must: [{ key: "repoId", match: { value: repoId } }] },
       with_payload: true,
       with_vector: false,
-      score_threshold: 0.3, // minimum cosine similarity
+      score_threshold: 0.3,
     });
 
     return results.map((hit) =>
@@ -281,12 +208,6 @@ export class QdrantStore {
     );
   }
 
-  // ─── Retrieve Specific Chunks by ID ────────────────────────────────────────
-
-  /**
-   * Retrieves full chunk data for a list of chunk IDs.
-   * Used by the hybrid search to hydrate graph neighbors.
-   */
   async getChunksByIds(chunkIds: string[]): Promise<ParsedChunk[]> {
     if (chunkIds.length === 0) return [];
 
@@ -311,11 +232,6 @@ export class QdrantStore {
     }
   }
 
-  // ─── Delete ────────────────────────────────────────────────────────────────
-
-  /**
-   * Removes stale chunks that no longer exist in the source.
-   */
   async deleteChunks(chunkIds: string[]): Promise<void> {
     if (chunkIds.length === 0) return;
 
@@ -323,7 +239,6 @@ export class QdrantStore {
       LOG_CTX,
       `Deleting ${chunkIds.length} stale chunks from Qdrant`,
     );
-
     const pointIds = chunkIds.map(deterministicPointId);
     await this.client.delete(this.collectionName, {
       wait: true,
@@ -331,52 +246,29 @@ export class QdrantStore {
     });
   }
 
-  /**
-   * Drops ALL vectors for a given repoId using a single Qdrant filter-based
-   * delete.  This replaces the previous getStoredHashes() + deleteChunks()
-   * N+1 pattern, which issued thousands of individual deletes for large repos.
-   *
-   * Qdrant's `delete` endpoint accepts a `filter` object — no IDs needed.
-   */
   async deleteByRepoId(repoId: string): Promise<void> {
     logger.info(LOG_CTX, `Deleting all vectors for repoId="${repoId}"…`);
     try {
       await this.client.delete(this.collectionName, {
         wait: true,
-        filter: {
-          must: [{ key: "repoId", match: { value: repoId } }],
-        },
+        filter: { must: [{ key: "repoId", match: { value: repoId } }] },
       });
       logger.info(LOG_CTX, `Deleted all vectors for repoId="${repoId}"`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      // If the collection doesn't exist (e.g., first run with no data), log
-      // and continue — this is not a fatal error during cleanup.
       logger.warn(
         LOG_CTX,
-        `deleteByRepoId failed for repoId="${repoId}" (collection may not exist): ${msg}`,
+        `deleteByRepoId failed for "${repoId}" (collection may not exist): ${msg}`,
       );
     }
   }
 
-  // ─── Teardown ──────────────────────────────────────────────────────────────
-
-  /**
-   * Drops the entire collection.  Use only in tests or full re-index.
-   */
   async dropCollection(): Promise<void> {
     await this.client.deleteCollection(this.collectionName);
     logger.warn(LOG_CTX, `Dropped collection "${this.collectionName}"`);
   }
 }
 
-// ─── Private Helpers ─────────────────────────────────────────────────────────
-
-/**
- * Builds a semantic-rich text representation of a chunk for embedding.
- * This is what the embedding model sees — we include both code and metadata
- * so the vector captures structural meaning, not just lexical similarity.
- */
 function buildEmbeddingText(chunk: ParsedChunk): string {
   const smellSummary =
     chunk.smells.length > 0
@@ -392,25 +284,11 @@ function buildEmbeddingText(chunk: ParsedChunk): string {
   ].join("\n");
 }
 
-/**
- * Converts a hex chunk ID string into a deterministic unsigned integer
- * suitable for Qdrant's point ID.
- *
- * Qdrant accepts either UUID strings or unsigned 64-bit integers.
- * We take the first 15 hex chars of the chunk ID and parse as an integer
- * (15 hex chars = 60 bits, fits safely in JS Number and Qdrant u64).
- */
 function deterministicPointId(chunkId: string): number {
-  // Take first 15 hex chars → parse as base-16 integer (up to 2^60 - 1)
   const hex = chunkId.replace(/[^a-f0-9]/gi, "").slice(0, 15);
   return parseInt(hex, 16);
 }
 
-/**
- * Reconstructs a minimal ParsedChunk from a Qdrant payload.
- * Not all fields survive the round-trip (e.g., full smells array),
- * but we reconstruct enough for the GraphRagContext.
- */
 function payloadToChunk(payload: Record<string, unknown>): ParsedChunk {
   return {
     id: (payload["chunkId"] as string) ?? "",

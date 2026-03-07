@@ -1,8 +1,7 @@
-// ─────────────────────────────────────────────────────────────────────────────
 // src/utils/logger.ts
-// Lightweight structured logger.  In production you'd swap this for pino/winston.
-// Kept minimal so the ingestor has zero opinion on your logging stack.
-// ─────────────────────────────────────────────────────────────────────────────
+//
+// Lightweight structured logger with coloured output.
+// Swap for pino/winston in production.
 
 type LogLevel = "INFO" | "WARN" | "ERROR" | "DEBUG";
 

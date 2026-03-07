@@ -1,83 +1,28 @@
-// ─────────────────────────────────────────────────────────────────────────────
 // src/council/tools/synthesis.tools.ts
 //
-// Synthesis / Pedagogical Agent Tools:
-//   1. generate_fixed_code_snippet — LLM-powered TARGETED code fix generation
+// Synthesis Agent Tools:
+//   1. generate_fixed_code_snippet — LLM-powered code fix with hard size guardrails
 //   2. fetch_documentation_reference — curated docs index lookup
 //
-// ★ Three-tier fix strategy:
-//   Tier 1 — "Windowed Diff":  Finding spans <30 lines → extract window ± 5
-//            lines of context, LLM rewrites only that ~40-line window.
-//   Tier 2 — "Architectural Warning":  Finding spans 50+ lines AND is a
-//            structural category (high-complexity, god-class, long-function)
-//            → bypass LLM entirely, return a pre-formatted refactor stub.
-//   Tier 3 — "Bounded Rewrite":  Everything else → cap code at 60 lines,
-//            LLM rewrites with XML-tag output for strict parsing.
+// Fix Strategy (strictly enforced BEFORE any LLM call):
+//   • >100 lines             → ALWAYS bypass, chunk too large for any auto-fix
+//   • >50 lines + complexity → bypass, architectural refactor stub returned
+//   • ≤30 lines + line nums  → windowed diff (narrow ±5 line extract)
+//   • everything else ≤100   → bounded rewrite (capped at 60 lines to LLM)
 //
-// ★ Strict output parsing:
-//   The LLM is forced to wrap its fix inside <fixed_code>…</fixed_code> XML
-//   tags.  A regex parser extracts the content.  If the tags are missing we
-//   fall back to ```code-block``` extraction, then to raw content.  We NEVER
-//   return `[]` — worst case we return a human-readable fallback string.
-// ─────────────────────────────────────────────────────────────────────────────
+// The LLM is forced to use <fixed_code>…</fixed_code> XML tags for output.
+// A 3-tier parser extracts the fix (XML → fenced code block → raw content).
+// We NEVER return [] or empty — worst case returns a human-readable stub.
 
 import type {
   AgentTool,
   LLMCompletionFn,
 } from "../../interfaces/council.interface";
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-
-/** Findings that span fewer than this many lines get the targeted window strategy */
 const WINDOWED_DIFF_LINE_THRESHOLD = 30;
-
-/** Findings that span more than this AND are structural → architectural warning */
-const ARCHITECTURAL_WARNING_LINE_THRESHOLD = 50;
-
-/** Maximum lines sent to the LLM in the bounded-rewrite fallback */
 const MAX_LLM_LINES = 60;
-
-/** Context buffer (lines above + below) for the windowed diff */
 const WINDOW_BUFFER = 5;
 
-/**
- * Finding categories that represent STRUCTURAL issues which cannot be
- * meaningfully auto-fixed by rewriting a code window.  For these, we
- * generate an architectural refactor stub instead of hallucinating a
- * broken rewrite.
- */
-const STRUCTURAL_CATEGORIES = new Set([
-  "high-complexity",
-  "cyclomatic-complexity",
-  "cyclomatic_complexity",
-  "god-class",
-  "god-module",
-  "long-function",
-  "long-method",
-  "deep-nesting",
-  "callback-hell",
-  "spaghetti",
-  "render-thrashing",
-]);
-
-// ─── extractWindow — Surgical Code Windowing ─────────────────────────────────
-
-/**
- * Extracts a narrow window of code around the vulnerable lines.
- *
- * @param code       The full chunk's source code.
- * @param chunkStart The 1-based start line of the chunk in the original file.
- * @param vulnStart  The 1-based start line of the vulnerability in the original file.
- * @param vulnEnd    The 1-based end line of the vulnerability in the original file.
- * @param buffer     Number of context lines above and below (default: 5).
- * @returns          The extracted window with its absolute line range.
- *
- * Example:
- *   Chunk covers lines 20-501 of EditListing.jsx.
- *   Finding says the issue is on lines 45-55.
- *   extractWindow(code, 20, 45, 55, 5)
- *   → returns lines 40-60 of the file (a ~20-line window).
- */
 export function extractWindow(
   code: string,
   chunkStart: number,
@@ -88,11 +33,8 @@ export function extractWindow(
   const lines = code.split("\n");
   const totalLines = lines.length;
 
-  // Convert absolute file lines → 0-based chunk-local indices
   const localVulnStart = Math.max(0, vulnStart - chunkStart);
   const localVulnEnd = Math.min(totalLines - 1, vulnEnd - chunkStart);
-
-  // Apply buffer, clamped to chunk bounds
   const windowLocalStart = Math.max(0, localVulnStart - buffer);
   const windowLocalEnd = Math.min(totalLines - 1, localVulnEnd + buffer);
 
@@ -105,106 +47,78 @@ export function extractWindow(
   return { windowCode, windowStartLine, windowEndLine };
 }
 
-// ─── Architectural Warning Stub Generator ────────────────────────────────────
-
-/**
- * Generates a structured, human-readable refactor stub for findings that
- * are too large / too structural for an LLM to auto-fix safely.
- *
- * This is displayed in the Monaco diff viewer as the "fixed" side, giving
- * the developer actionable guidance instead of a hallucinated rewrite.
- */
-function generateArchitecturalWarningStub(
-  category: string,
+function generateArchitecturalStub(
+  lineCount: number,
   description: string,
-  filePath: string,
-  startLine: number,
-  endLine: number,
-  codeLines: number,
-  cyclomaticComplexity?: number,
+  category: string,
 ): string {
-  const lineSpan = endLine - startLine + 1;
-
-  // Extract actionable hints from the category / description
   const hints: string[] = [];
 
   if (/complex/i.test(category) || /complex/i.test(description)) {
     hints.push(
-      "1. Extract each branch of complex switch/if-else chains into named handler functions.",
-      "2. Use a strategy map (Record<string, Handler>) instead of long switch statements.",
-      "3. Split data-fetching logic into a custom hook (e.g., useListingData).",
+      "Extract each branch of complex switch/if-else chains into named handler functions.",
+      "Use a strategy map (Record<string, Handler>) instead of long switch statements.",
+      "Split data-fetching logic into a custom hook (e.g., useListingData).",
     );
   }
   if (/callback/i.test(category) || /nesting/i.test(description)) {
     hints.push(
-      "1. Replace nested callbacks with async/await.",
-      "2. Extract each nesting level into a named function with a clear responsibility.",
+      "Replace nested callbacks with async/await.",
+      "Extract each nesting level into a named function with a clear responsibility.",
     );
   }
   if (/god/i.test(category) || /long/i.test(category)) {
     hints.push(
-      "1. Apply the Single Responsibility Principle — each function should do one thing.",
-      "2. Extract reusable logic into separate modules/hooks.",
-      "3. Use composition (smaller components/functions) instead of one monolithic block.",
+      "Apply the Single Responsibility Principle — each function should do one thing.",
+      "Extract reusable logic into separate modules/hooks.",
+      "Use composition (smaller components/functions) instead of one monolithic block.",
     );
   }
   if (/render/i.test(category) || /react/i.test(description)) {
     hints.push(
-      "1. Wrap child components with React.memo() to prevent unnecessary re-renders.",
-      "2. Move inline object/function creation out of JSX props (use useMemo/useCallback).",
-      "3. Extract complex rendering logic into dedicated sub-components.",
+      "Wrap child components with React.memo() to prevent unnecessary re-renders.",
+      "Move inline object/function creation out of JSX props (use useMemo/useCallback).",
+      "Extract complex rendering logic into dedicated sub-components.",
     );
   }
 
-  // Fallback hints if nothing matched
   if (hints.length === 0) {
     hints.push(
-      "1. Break this function into smaller, single-responsibility functions.",
-      "2. Extract reusable logic into utility modules.",
-      "3. Add unit tests for each extracted function before refactoring.",
+      "Break this function into smaller, single-responsibility functions.",
+      "Extract reusable logic into utility modules.",
+      "Add unit tests for each extracted function before refactoring.",
     );
   }
 
-  return [
-    `// ⚠️ ARCHITECTURAL REFACTOR REQUIRED`,
-    `//`,
-    `// This chunk is too large (${codeLines} lines, L${startLine}–L${endLine}) to safely auto-fix.`,
-    `// Category: ${category}`,
-    ...(cyclomaticComplexity != null
-      ? [`// Cyclomatic Complexity: ${cyclomaticComplexity}`]
-      : []),
-    `// ${description.slice(0, 200)}${description.length > 200 ? "…" : ""}`,
-    `//`,
-    `// ── Recommended Actions ──────────────────────────────────────`,
-    ...hints.map((h) => `// ${h}`),
-    `//`,
-    `// ── How to approach this refactor ────────────────────────────`,
-    `// a) Write characterisation tests for the current behaviour FIRST.`,
-    `// b) Extract one small function at a time, re-run tests after each.`,
-    `// c) Use IDE "Extract Function" refactoring to maintain correctness.`,
-    `// d) Target: no single function should exceed 50 lines or CC > 10.`,
-  ].join("\n");
+  const ccMatch = description.match(/complexity\s*(?:of|:)\s*(\d+)/i);
+  const ccLine = ccMatch ? `// Cyclomatic Complexity: ${ccMatch[1]}\n` : "";
+
+  return (
+    `// ⚠️ ARCHITECTURAL REFACTOR REQUIRED\n` +
+    `//\n` +
+    `// This function (${lineCount} lines) is too complex to safely auto-fix.\n` +
+    `// Category: ${category || "structural-issue"}\n` +
+    ccLine +
+    `// ${description.slice(0, 200)}${description.length > 200 ? "…" : ""}\n` +
+    `//\n` +
+    `// ── Recommended Actions ──────────────────────────────────────\n` +
+    hints.map((h) => `// • ${h}`).join("\n") +
+    `\n//\n` +
+    `// ── How to approach this refactor ────────────────────────────\n` +
+    `// a) Write characterisation tests for the current behaviour FIRST.\n` +
+    `// b) Extract one small function at a time, re-run tests after each.\n` +
+    `// c) Use IDE "Extract Function" refactoring to maintain correctness.\n` +
+    `// d) Target: no single function should exceed 50 lines or CC > 10.`
+  );
 }
 
-// ─── XML Tag Parser ──────────────────────────────────────────────────────────
-
-/**
- * Strict 3-tier parser for the LLM's fix output:
- *   1. Try <fixed_code>…</fixed_code> XML tags (preferred).
- *   2. Try ```language … ``` code block (fallback).
- *   3. Use the raw content (last resort — never returns empty).
- *
- * NEVER returns `[]`, `""`, or `undefined`.
- */
 function parseFixedCodeFromLLMResponse(content: string): {
   fixedCode: string;
   changeSummary: string;
 } {
-  // ── Tier 1: XML tags ──
   const xmlMatch = content.match(/<fixed_code>([\s\S]*?)<\/fixed_code>/i);
   if (xmlMatch?.[1]?.trim()) {
     const fixedCode = xmlMatch[1].trim();
-    // Summary is everything outside the tags
     const summary = content
       .replace(/<fixed_code>[\s\S]*?<\/fixed_code>/i, "")
       .trim();
@@ -215,7 +129,6 @@ function parseFixedCodeFromLLMResponse(content: string): {
     };
   }
 
-  // ── Tier 2: Fenced code block ──
   const codeBlockMatch = content.match(/```[\w]*\n([\s\S]*?)```/);
   if (codeBlockMatch?.[1]?.trim()) {
     const fixedCode = codeBlockMatch[1].trim();
@@ -229,7 +142,6 @@ function parseFixedCodeFromLLMResponse(content: string): {
     };
   }
 
-  // ── Tier 3: Raw content (never empty) ──
   const trimmed = content.trim();
   if (trimmed.length > 0 && trimmed !== "[]") {
     return {
@@ -238,7 +150,6 @@ function parseFixedCodeFromLLMResponse(content: string): {
     };
   }
 
-  // Absolute last resort — this should be unreachable
   return {
     fixedCode:
       "// ⚠️ LLM returned an empty response. Please fix this issue manually.",
@@ -246,17 +157,6 @@ function parseFixedCodeFromLLMResponse(content: string): {
   };
 }
 
-// ─── generate_fixed_code_snippet ─────────────────────────────────────────────
-
-/**
- * Three-tier tool:
- *   Tier 1 — Windowed Diff (localised findings <30 lines)
- *   Tier 2 — Architectural Warning (structural findings >50 lines)
- *   Tier 3 — Bounded Rewrite (everything else, capped at 60 lines)
- *
- * Uses XML-tag output format for strict parsing.
- * NEVER returns `[]` or an empty string.
- */
 export function createGenerateFixedCodeSnippetTool(
   llmFn: LLMCompletionFn,
 ): AgentTool {
@@ -265,38 +165,33 @@ export function createGenerateFixedCodeSnippetTool(
     description:
       "Generates a corrected version of flagged code. Provide the " +
       "vulnerability's exact startLine and endLine so the tool can apply " +
-      "the correct fix strategy (windowed diff, architectural warning, " +
-      "or bounded rewrite). Returns fixed code wrapped for the diff viewer.",
+      "the correct fix strategy. Returns fixed code for the diff viewer.",
     parameters: {
       type: "object",
       properties: {
         originalCode: {
           type: "string",
-          description:
-            "The full chunk source code (the tool extracts the relevant window).",
+          description: "The full chunk source code.",
         },
         findingDescription: {
           type: "string",
-          description:
-            "Description of the issue: what's wrong and how to fix it.",
+          description: "Description of the issue.",
         },
         findingCategory: {
           type: "string",
-          description:
-            "The finding's category slug (e.g., 'sql-injection', 'high-complexity', 'n-plus-one').",
+          description: "The finding's category slug.",
         },
         chunkStartLine: {
           type: "number",
-          description:
-            "The 1-based start line of the chunk in the original file.",
+          description: "1-based start line of the chunk in the original file.",
         },
         vulnStartLine: {
           type: "number",
-          description: "The 1-based start line of the specific vulnerability.",
+          description: "1-based start line of the vulnerability.",
         },
         vulnEndLine: {
           type: "number",
-          description: "The 1-based end line of the specific vulnerability.",
+          description: "1-based end line of the vulnerability.",
         },
         language: {
           type: "string",
@@ -322,77 +217,73 @@ export function createGenerateFixedCodeSnippetTool(
         });
       }
 
-      const codeLines = originalCode.split("\n");
-      const vulnSpan =
-        vulnStartLine > 0 && vulnEndLine > 0
-          ? vulnEndLine - vulnStartLine + 1
-          : codeLines.length;
-
-      // ─────────────────────────────────────────────────────────────
-      // TIER 2: Architectural Warning  (checked FIRST because it
-      // short-circuits without an LLM call — saves time & tokens)
-      //
-      // Triggers when EITHER:
-      //   a) The finding's vulnerability span exceeds the threshold, OR
-      //   b) The full chunk itself exceeds the threshold
-      // AND the finding is structural in nature.
-      // ─────────────────────────────────────────────────────────────
-      const isStructuralCategory = STRUCTURAL_CATEGORIES.has(findingCategory);
-      // Also detect structural patterns from the description text
+      const lineCount = originalCode.split("\n").length;
       const descLower = findingDescription.toLowerCase();
-      const looksStructural =
-        isStructuralCategory ||
-        /cyclomatic complexity/i.test(descLower) ||
-        /too many (lines|params|parameters)/i.test(descLower) ||
-        /god (class|module|function)/i.test(descLower) ||
-        /callback hell/i.test(descLower) ||
-        /high.complexity/i.test(descLower);
+      const catLower = findingCategory;
 
-      // ★ Use the LARGER of vulnSpan and codeLines.length for the size check.
-      //   This prevents the bypass from being skipped when line numbers are
-      //   missing (vulnStartLine=0, vulnEndLine=0) and the code was truncated.
-      const effectiveSpan = Math.max(vulnSpan, codeLines.length);
+      const isComplexityIssue =
+        descLower.includes("complexity") ||
+        descLower.includes("large") ||
+        descLower.includes("too many") ||
+        descLower.includes("god class") ||
+        descLower.includes("god module") ||
+        descLower.includes("callback hell") ||
+        descLower.includes("deep nesting") ||
+        catLower.includes("complex") ||
+        catLower.includes("god") ||
+        catLower.includes("long") ||
+        catLower.includes("nesting") ||
+        catLower.includes("callback") ||
+        catLower.includes("spaghetti") ||
+        catLower.includes("render-thrashing");
 
-      if (
-        effectiveSpan > ARCHITECTURAL_WARNING_LINE_THRESHOLD &&
-        looksStructural
-      ) {
-        // ★ Extract complexity number from description if available
-        //   e.g., "Function has cyclomatic complexity of 60 (threshold: 10)"
-        const ccMatch = findingDescription.match(
-          /complexity\s*(?:of|:)\s*(\d+)/i,
-        );
-        const ccValue = ccMatch ? parseInt(ccMatch[1]!, 10) : undefined;
+      if (lineCount > 100) {
+        const stub =
+          `// ⚠️ CHUNK TOO LARGE FOR AUTO-FIX (${lineCount} lines)\n` +
+          `// This file exceeds the safe threshold for automated refactoring.\n` +
+          `// Please review the finding: ${findingDescription.slice(0, 200)}\n` +
+          `// Recommended: Break this component into smaller modules.`;
 
-        const stub = generateArchitecturalWarningStub(
-          findingCategory || "structural-issue",
+        return JSON.stringify({
+          fixedCode: stub,
+          changeSummary: `Chunk is ${lineCount} lines — too large to auto-fix safely.`,
+          language,
+          strategy: "hard-bypass-too-large",
+          window: {
+            startLine: vulnStartLine || chunkStartLine,
+            endLine: vulnEndLine || chunkStartLine + lineCount - 1,
+            linesInWindow: lineCount,
+          },
+        });
+      }
+
+      if (lineCount > 50 && isComplexityIssue) {
+        const stub = generateArchitecturalStub(
+          lineCount,
           findingDescription,
-          "", // filePath not available here, but that's fine
-          vulnStartLine || chunkStartLine,
-          vulnEndLine || chunkStartLine + codeLines.length - 1,
-          codeLines.length,
-          ccValue,
+          findingCategory,
         );
 
         return JSON.stringify({
           fixedCode: stub,
           changeSummary:
-            `Architectural refactor stub generated (${codeLines.length}-line chunk, ` +
-            `${findingCategory || "structural"} issue). ` +
-            "Auto-fix was bypassed because this issue requires manual decomposition.",
+            `Architectural refactor stub generated (${lineCount}-line chunk, ` +
+            `${findingCategory || "structural"} issue). Auto-fix bypassed.`,
           language,
           strategy: "architectural-warning",
           window: {
             startLine: vulnStartLine || chunkStartLine,
-            endLine: vulnEndLine || chunkStartLine + codeLines.length - 1,
-            linesInWindow: codeLines.length,
+            endLine: vulnEndLine || chunkStartLine + lineCount - 1,
+            linesInWindow: lineCount,
           },
         });
       }
 
-      // ─────────────────────────────────────────────────────────────
-      // TIER 1: Windowed Diff  (localised findings <30 lines)
-      // ─────────────────────────────────────────────────────────────
+      const vulnSpan =
+        vulnStartLine > 0 && vulnEndLine > 0
+          ? vulnEndLine - vulnStartLine + 1
+          : lineCount;
+
       let codeForLLM: string;
       let windowStartLine: number;
       let windowEndLine: number;
@@ -414,18 +305,13 @@ export function createGenerateFixedCodeSnippetTool(
         windowStartLine = win.windowStartLine;
         windowEndLine = win.windowEndLine;
         strategy = "windowed-diff";
-      }
-      // ─────────────────────────────────────────────────────────────
-      // TIER 3: Bounded Rewrite  (everything else)
-      // ─────────────────────────────────────────────────────────────
-      else if (codeLines.length <= MAX_LLM_LINES) {
-        // Small-ish chunk — send in full
+      } else if (lineCount <= MAX_LLM_LINES) {
         codeForLLM = originalCode;
         windowStartLine = chunkStartLine;
-        windowEndLine = chunkStartLine + codeLines.length - 1;
+        windowEndLine = chunkStartLine + lineCount - 1;
         strategy = "bounded-rewrite-full";
       } else {
-        // Large chunk — truncate to MAX_LLM_LINES with a marker
+        const codeLines = originalCode.split("\n");
         codeForLLM =
           codeLines.slice(0, MAX_LLM_LINES).join("\n") +
           "\n// ... (remaining code omitted — fix only the code above)";
@@ -434,9 +320,6 @@ export function createGenerateFixedCodeSnippetTool(
         strategy = "bounded-rewrite-truncated";
       }
 
-      // ─────────────────────────────────────────────────────────────
-      // LLM Call — with strict XML-tag output format
-      // ─────────────────────────────────────────────────────────────
       try {
         const response = await llmFn(
           [
@@ -447,10 +330,10 @@ export function createGenerateFixedCodeSnippetTool(
                 "OUTPUT FORMAT — YOU MUST FOLLOW THIS EXACTLY:\n" +
                 "1. Wrap your fixed code inside XML tags: <fixed_code>…your code…</fixed_code>\n" +
                 "2. After the closing tag, write a 1-2 sentence summary of what you changed.\n" +
-                "3. Do NOT use markdown code blocks (```). Use ONLY the XML tags.\n" +
+                "3. Do NOT use markdown code blocks. Use ONLY the XML tags.\n" +
                 "4. Do NOT output an empty array [] or empty string.\n\n" +
                 "RULES:\n" +
-                "1. You are given ONLY the vulnerable code window (~10-40 lines), NOT the full file.\n" +
+                "1. You are given ONLY the vulnerable code window, NOT the full file.\n" +
                 "2. Fix ONLY the specific issue described. Do NOT restructure unrelated code.\n" +
                 "3. Your output MUST be a drop-in replacement for the window — same indentation.\n" +
                 "4. If the fix needs a new import, add a comment: // REQUIRES IMPORT: <stmt>\n" +
@@ -475,7 +358,6 @@ export function createGenerateFixedCodeSnippetTool(
           0.2,
         );
 
-        // ── Strict 3-tier parse ──
         const { fixedCode, changeSummary } = parseFixedCodeFromLLMResponse(
           response.content,
         );
@@ -493,7 +375,6 @@ export function createGenerateFixedCodeSnippetTool(
         });
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        // NEVER return `[]` — always return a meaningful fallback
         return JSON.stringify({
           fixedCode:
             `// ⚠️ Auto-fix generation failed: ${msg}\n` +
@@ -513,31 +394,22 @@ export function createGenerateFixedCodeSnippetTool(
   };
 }
 
-// ─── fetch_documentation_reference ───────────────────────────────────────────
-
-/**
- * Looks up authoritative documentation references for technologies and concepts.
- * Uses a curated mapping of common security, performance, and best-practice resources.
- */
 export function createFetchDocumentationReferenceTool(): AgentTool {
   return {
     name: "fetch_documentation_reference",
     description:
       "Fetches authoritative documentation references for a given technology " +
-      "and concept (e.g., OWASP for SQL injection, MDN for fetch API). " +
-      "Returns titles and URLs for inclusion in finding cards.",
+      "and concept. Returns titles and URLs for inclusion in finding cards.",
     parameters: {
       type: "object",
       properties: {
         technology: {
           type: "string",
-          description:
-            "The technology area (e.g., 'node.js', 'express', 'react', 'security').",
+          description: "The technology area (e.g., 'node.js', 'react').",
         },
         conceptName: {
           type: "string",
-          description:
-            "The specific concept (e.g., 'sql-injection', 'xss', 'memory-leak').",
+          description: "The specific concept (e.g., 'sql-injection', 'xss').",
         },
       },
       required: ["technology", "conceptName"],
@@ -570,12 +442,9 @@ interface DocReference {
   url: string;
 }
 
-/** Curated documentation reference index */
 function lookupReferences(technology: string, concept: string): DocReference[] {
   const refs: DocReference[] = [];
-  const key = `${technology}:${concept}`;
 
-  // ── Security references (OWASP, CWE) ──
   const securityRefs: Record<string, DocReference[]> = {
     "sql-injection": [
       {
@@ -653,7 +522,6 @@ function lookupReferences(technology: string, concept: string): DocReference[] {
     ],
   };
 
-  // ── Performance references ──
   const perfRefs: Record<string, DocReference[]> = {
     "memory-leak": [
       {
@@ -672,7 +540,6 @@ function lookupReferences(technology: string, concept: string): DocReference[] {
     ],
   };
 
-  // ── Node.js / Express references ──
   const nodeRefs: Record<string, DocReference[]> = {
     "error-handling": [
       {
@@ -695,7 +562,6 @@ function lookupReferences(technology: string, concept: string): DocReference[] {
     ],
   };
 
-  // Match by concept name (fuzzy)
   for (const [pattern, docRefs] of Object.entries(securityRefs)) {
     if (concept.includes(pattern) || pattern.includes(concept)) {
       refs.push(...docRefs);
@@ -721,7 +587,6 @@ function lookupReferences(technology: string, concept: string): DocReference[] {
     }
   }
 
-  // Deduplicate by URL
   const seen = new Set<string>();
   return refs.filter((r) => {
     if (seen.has(r.url)) return false;

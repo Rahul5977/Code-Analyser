@@ -1,22 +1,19 @@
-// ─────────────────────────────────────────────────────────────────────────────
 // src/delivery/worker.ts
 //
-// Phase 5 – BullMQ Worker: Full Analysis Pipeline + Cleanup.
+// BullMQ Worker — Full Analysis Pipeline + Deterministic Cleanup.
 //
-// Responsibilities:
-//   1. Listen on the `repo-analysis-queue` for incoming jobs.
-//   2. Execute the full pipeline: Ingest → Triage → GraphRAG Sync → Council.
-//   3. Publish real-time progress events via Redis Pub/Sub at every stage.
-//   4. On completion, deliver a webhook if `callbackUrl` was provided.
-//   5. In the `finally` block, execute deterministic cleanup:
-//        a) Disk:   rm -rf /temp/<jobId>
-//        b) Qdrant: delete collection `repo_<jobId>`
-//        c) Neo4j:  MATCH (n {jobId: $jobId}) DETACH DELETE n
-//        d) Emit:   `job:cleanup:complete` → closes SSE stream
+// Listens on `repo-analysis-queue` and executes:
+//   Ingest → Triage → GraphRAG Sync → Council → Webhook → Cleanup.
 //
-// Every cleanup step is wrapped in its own try/catch so that a failure in one
-// (e.g., disk permissions error) never prevents the others from running.
-// ─────────────────────────────────────────────────────────────────────────────
+// Real-time progress is published via Redis Pub/Sub at every stage.
+// The finally block runs five independent cleanup steps, each wrapped
+// in withCleanupTimeout() so a single hung DB call never blocks the
+// worker indefinitely:
+//   1. Disk   (5s)  — rm -rf /temp/<jobId>
+//   2. Qdrant (10s) — filter-based vector delete by repoId
+//   3. Neo4j  (15s) — batched label-anchored Cypher delete by repoId
+//   4. Close  (5s)  — driver pool teardown
+//   5. SSE    — emit job:cleanup:complete to close the stream
 
 import { Worker, type Job } from "bullmq";
 import fs from "node:fs/promises";
@@ -46,19 +43,14 @@ import type {
 const LOG_CTX = "Worker";
 const TEMP_DIR = path.resolve(process.cwd(), "temp");
 
-// ─── Job Data Shape ──────────────────────────────────────────────────────────
-
 interface AnalysisJobData {
   jobId: string;
   repoUrl: string;
   callbackUrl: string | null;
 }
 
-// ─── Smart Stub LLM (imported from shared module) ────────────────────────────
 import { createSmartStubLlm } from "../council/smart-stub-llm";
 const stubLlmFn = createSmartStubLlm();
-
-// ─── Stub Embedding (mirrors src/index.ts) ───────────────────────────────────
 
 const stubEmbedFn: EmbedFunction = async (text: string): Promise<number[]> => {
   const dim = Number(process.env["EMBEDDING_DIM"] ?? "384");
@@ -78,8 +70,6 @@ const stubEmbedFn: EmbedFunction = async (text: string): Promise<number[]> => {
 const stubEmbedBatchFn: EmbedBatchFunction = async (
   texts: string[],
 ): Promise<number[][]> => Promise.all(texts.map((t) => stubEmbedFn(t)));
-
-// ─── GraphRAG Config (mirrors src/index.ts) ──────────────────────────────────
 
 function getGraphRagConfig(): GraphRagConfig {
   return {
@@ -109,8 +99,6 @@ function getCouncilConfig(): CouncilConfig {
     temperature: Number(process.env["COUNCIL_TEMPERATURE"] ?? "0.3"),
   };
 }
-
-// ─── Webhook Delivery ────────────────────────────────────────────────────────
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
 const WEBHOOK_MAX_RETRIES = 3;
@@ -161,7 +149,6 @@ async function deliverWebhook(
       );
     }
 
-    // Exponential back-off: 1s, 2s, 4s
     if (attempt < WEBHOOK_MAX_RETRIES) {
       await sleep(1000 * Math.pow(2, attempt - 1));
     }
@@ -173,15 +160,6 @@ async function deliverWebhook(
   );
 }
 
-// ─── Cleanup Functions ───────────────────────────────────────────────────────
-
-/**
- * Wraps any cleanup promise in a hard timeout so that a single hung
- * database call never blocks the entire `finally` block.
- *
- * If the operation times out, it logs a warning and resolves (never rejects)
- * so that subsequent cleanup steps still execute.
- */
 async function withCleanupTimeout<T>(
   label: string,
   timeoutMs: number,
@@ -244,10 +222,6 @@ async function cleanupQdrant(
 
 async function cleanupNeo4j(
   service: GraphRagService | null,
-  // ★ FIX Bug 2: Accept repoId (not jobId).
-  // The graph data was stored under repoId (e.g. "owner/repo"), NOT the
-  // BullMQ jobId UUID.  Passing jobId here previously caused the cleanup
-  // to match nothing in Neo4j, leaking the full graph on every job.
   repoId: string,
 ): Promise<void> {
   try {
@@ -267,19 +241,6 @@ async function cleanupNeo4j(
   }
 }
 
-// ─── The BullMQ Worker ───────────────────────────────────────────────────────
-
-/**
- * Creates and returns a BullMQ Worker that processes `repo-analysis` jobs.
- *
- * The worker implements the full pipeline:
- *   Phase 1  → Ingest
- *   Phase 2  → Parse & Triage
- *   Phase 3  → GraphRAG Sync
- *   Phase 4  → Council Multi-Agent Analysis
- *   Webhook  → Deliver callback (if provided)
- *   Cleanup  → Disk, Qdrant, Neo4j, SSE termination (always runs)
- */
 export function createAnalysisWorker(): Worker {
   const redisCfg = getRedisConfig();
 
@@ -288,10 +249,9 @@ export function createAnalysisWorker(): Worker {
     async (job: Job<AnalysisJobData>) => {
       const { jobId, repoUrl, callbackUrl } = job.data;
       let graphRagService: GraphRagService | null = null;
-      let repoId = jobId; // default — may be overridden
+      let repoId = jobId;
 
       try {
-        // ── Phase 1: Ingest ──────────────────────────────────────────────
         await publishProgress(
           jobId,
           "phase:ingest:start",
@@ -304,7 +264,6 @@ export function createAnalysisWorker(): Worker {
           `Ingested ${manifest.targetFiles.length} files`,
         );
 
-        // ── Phase 2: Parse & Triage ──────────────────────────────────────
         await publishProgress(
           jobId,
           "phase:triage:start",
@@ -320,7 +279,6 @@ export function createAnalysisWorker(): Worker {
           `Triaged ${triage.chunks.length} chunks across ${new Set(triage.chunks.map((c) => c.filePath)).size} files`,
         );
 
-        // ── Derive repoId ────────────────────────────────────────────────
         repoId =
           repoUrl
             .replace(/\.git$/, "")
@@ -329,7 +287,6 @@ export function createAnalysisWorker(): Worker {
             .slice(-2)
             .join("/") || jobId;
 
-        // ── Phase 3: GraphRAG Sync ───────────────────────────────────────
         await publishProgress(
           jobId,
           "phase:graphrag:start",
@@ -349,13 +306,11 @@ export function createAnalysisWorker(): Worker {
           `Synced: ${syncReport.newChunks} new, ${syncReport.updatedChunks} updated, ${syncReport.deletedChunks} deleted`,
         );
 
-        // ── Phase 4: Council Multi-Agent Analysis ────────────────────────
         await publishProgress(
           jobId,
           "phase:council:start",
           "Starting multi-agent council analysis…",
         );
-
         const councilConfig = getCouncilConfig();
         const councilDeps: CouncilDependencies = {
           toolDeps: {
@@ -375,7 +330,6 @@ export function createAnalysisWorker(): Worker {
           councilConfig,
           councilDeps,
         );
-
         await publishProgress(
           jobId,
           "phase:council:complete",
@@ -383,10 +337,8 @@ export function createAnalysisWorker(): Worker {
           { summary: councilReport.summary },
         );
 
-        // ── Store report for retrieval / diffing ─────────────────────────
         storeReport(jobId, councilReport);
 
-        // ── Webhook delivery ─────────────────────────────────────────────
         if (callbackUrl) {
           await publishProgress(
             jobId,
@@ -406,50 +358,19 @@ export function createAnalysisWorker(): Worker {
         const msg = err instanceof Error ? err.message : String(err);
         logger.error(LOG_CTX, `Job ${jobId} FAILED: ${msg}`);
         await publishProgress(jobId, "job:error", `Analysis failed: ${msg}`);
-        throw err; // re-throw so BullMQ marks the job as failed
+        throw err;
       } finally {
-        // ────────────────────────────────────────────────────────────────
-        // THE ULTIMATE CLEANUP BLOCK
-        //
-        // Every step is independently wrapped in:
-        //   a) its own try/catch, so a failure in one never skips the rest.
-        //   b) withCleanupTimeout(), so a hung DB call (e.g., Neo4j OOM)
-        //      never blocks the worker indefinitely.
-        //
-        // Timeout budget per step:
-        //   Disk   →  5 s  (local fs, should be instant)
-        //   Qdrant → 10 s  (HTTP delete call)
-        //   Neo4j  → 15 s  (Cypher delete, batched — much faster now)
-        //   Close  →  5 s  (driver pool teardown)
-        // ────────────────────────────────────────────────────────────────
-
         logger.info(LOG_CTX, `[finally] Starting cleanup for job=${jobId}`);
         await publishProgress(jobId, "job:cleanup:start", "Starting cleanup…");
 
-        // Step 1: Disk cleanup — rm -rf /temp/<jobId>
         await withCleanupTimeout("disk", 5_000, () => cleanupDisk(jobId));
-
-        // Step 2: Vector DB cleanup — drop Qdrant data for this repo
-        // ★ NOTE: cleanupQdrant internally calls graphRagService.dropRepo()
-        //   which also deletes Neo4j data.  We call cleanupNeo4j separately
-        //   below because graphRagService.dropRepo() may have already handled
-        //   it — Neo4j.dropRepo is idempotent (MATCH will simply find nothing).
         await withCleanupTimeout("qdrant", 10_000, () =>
           cleanupQdrant(graphRagService, repoId),
         );
-
-        // Step 3: Graph DB cleanup — label-anchored batched DELETE (no [*])
-        // ★ FIX Bug 2: pass repoId (not jobId) — this is the key the graph
-        //   was stored under.  Passing jobId previously deleted nothing and
-        //   caused a full graph leak on every job completion.
         await withCleanupTimeout("neo4j", 15_000, () =>
           cleanupNeo4j(graphRagService, repoId),
         );
 
-        // Step 4: Close GraphRAG service connections
-        // ★ FIX Bug 3: close() runs AFTER all delete operations, not before.
-        //   Previously if Neo4j cleanup was slow, close() could race with it
-        //   leaving the driver in a partially-closed state.
         await withCleanupTimeout("connections", 5_000, async () => {
           if (graphRagService) {
             await graphRagService.close();
@@ -460,7 +381,6 @@ export function createAnalysisWorker(): Worker {
           }
         });
 
-        // Step 5: Emit terminal event → SSE endpoint closes the stream
         await publishProgress(
           jobId,
           "job:cleanup:complete",
@@ -480,12 +400,11 @@ export function createAnalysisWorker(): Worker {
       concurrency: Number(process.env["WORKER_CONCURRENCY"] ?? "2"),
       limiter: {
         max: Number(process.env["WORKER_RATE_LIMIT"] ?? "5"),
-        duration: 60_000, // 5 jobs per minute
+        duration: 60_000,
       },
     },
   );
 
-  // ── Worker lifecycle events ──
   worker.on("completed", (job: Job<AnalysisJobData>) => {
     logger.info(LOG_CTX, `✔ Job ${job.data.jobId} completed successfully`);
   });
@@ -505,8 +424,6 @@ export function createAnalysisWorker(): Worker {
   );
   return worker;
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

@@ -1,26 +1,20 @@
-// ─────────────────────────────────────────────────────────────────────────────
 // src/graph-rag/neo4j.store.ts
 //
 // Neo4j Property Graph Layer — The Knowledge Graph.
 //
 // Graph Model:
+//   (:Repo {id})─[:CONTAINS]→(:File {path, repoId})─[:CONTAINS_CHUNK]→(:Chunk {id, hash, …})
+//   (:Chunk)─[:BELONGS_TO]→(:File)
+//   (:Chunk)─[:CALLS]→(:Chunk)     (inferred from resolved deps + line overlap)
+//   (:File)─[:IMPORTS]→(:File)
 //
-//   (:Repo {id})
-//       │
-//       ├──[:CONTAINS]──▶ (:File {path, repoId})
-//       │                      │
-//       │                      ├──[:CONTAINS_CHUNK]──▶ (:Chunk {id, hash, …})
-//       │                      │
-//       │                      └──[:IMPORTS]──▶ (:File)
-//       │
-//       └──[:CONTAINS]──▶ (:File) …
+// Provides: connectivity verification, schema initialisation (indexes +
+// constraints), full graph construction from triage results, hash retrieval
+// for the diff engine, structural neighbor queries for hybrid search,
+// stale-chunk deletion, repo teardown (batched label-anchored Cypher —
+// no unbounded [*] traversal), and driver lifecycle management.
 //
-//   (:Chunk)──[:BELONGS_TO]──▶(:File)
-//   (:Chunk)──[:CALLS]──▶(:Chunk)         (inferred from resolved deps + line overlap)
-//
-// All mutations use MERGE to achieve idempotency on re-runs.
-// All reads use the Neo4j driver's session/transaction API.
-// ─────────────────────────────────────────────────────────────────────────────
+// All mutations use MERGE for idempotency on re-runs.
 
 import neo4j, { Driver, Session, ManagedTransaction } from "neo4j-driver";
 import { logger } from "../utils/logger";
@@ -28,8 +22,6 @@ import { computeHash } from "./diff.engine";
 import type { ParsedChunk, TriageResult } from "../interfaces/triage.interface";
 
 const LOG_CTX = "Neo4jStore";
-
-// ── Batch size for Cypher UNWIND operations ──────────────────────────────────
 const BATCH_SIZE = 200;
 
 export class Neo4jStore {
@@ -45,16 +37,10 @@ export class Neo4jStore {
     this.driver = neo4j.driver(uri, neo4j.auth.basic(username, password), {
       maxConnectionPoolSize: 50,
       connectionAcquisitionTimeout: 30_000,
-      // Disable encryption for local dev; enable in production
     });
     this.database = database;
   }
 
-  // ─── Connection Verification ───────────────────────────────────────────────
-
-  /**
-   * Verifies that we can connect to Neo4j and the target database exists.
-   */
   async verifyConnectivity(): Promise<void> {
     try {
       await this.driver.verifyConnectivity({ database: this.database });
@@ -65,35 +51,22 @@ export class Neo4jStore {
     }
   }
 
-  // ─── Schema Initialisation ─────────────────────────────────────────────────
-
-  /**
-   * Creates indexes and constraints for optimal query performance.
-   * Safe to call repeatedly — uses IF NOT EXISTS.
-   */
   async ensureSchema(): Promise<void> {
     const session = this.getSession();
     try {
       await session.executeWrite(async (tx: ManagedTransaction) => {
-        // Unique constraint on Chunk.id ensures MERGE works correctly
         await tx.run(`
           CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS
           FOR (c:Chunk) REQUIRE c.id IS UNIQUE
         `);
-
-        // Index on File.path for fast lookups
         await tx.run(`
           CREATE INDEX file_path_index IF NOT EXISTS
           FOR (f:File) ON (f.path)
         `);
-
-        // Index on Repo.id
         await tx.run(`
           CREATE CONSTRAINT repo_id_unique IF NOT EXISTS
           FOR (r:Repo) REQUIRE r.id IS UNIQUE
         `);
-
-        // Composite index for filtering chunks by repo
         await tx.run(`
           CREATE INDEX chunk_repo_index IF NOT EXISTS
           FOR (c:Chunk) ON (c.repoId)
@@ -105,20 +78,6 @@ export class Neo4jStore {
     }
   }
 
-  // ─── Graph Construction ────────────────────────────────────────────────────
-
-  /**
-   * Ingests the full triage result into the knowledge graph.
-   *
-   * Performs these operations inside a single write transaction:
-   *   1. MERGE the :Repo node
-   *   2. MERGE :File nodes for every unique file path
-   *   3. Create (:Repo)-[:CONTAINS]->(:File) edges
-   *   4. MERGE :Chunk nodes with properties (hash, complexity, etc.)
-   *   5. Create (:Chunk)-[:BELONGS_TO]->(:File) edges
-   *   6. Create (:File)-[:IMPORTS]->(:File) edges from adjacencyList
-   *   7. Create (:Chunk)-[:CALLS]->(:Chunk) edges where inferable
-   */
   async ingestGraph(
     chunks: ParsedChunk[],
     adjacencyList: Record<string, string[]>,
@@ -136,10 +95,9 @@ export class Neo4jStore {
       LOG_CTX,
       `Ingesting ${chunks.length} chunks into Neo4j knowledge graph…`,
     );
-
     const session = this.getSession();
+
     try {
-      // ── Step 1: MERGE the Repo node ──
       await session.executeWrite(async (tx: ManagedTransaction) => {
         await tx.run(
           `MERGE (r:Repo {id: $repoId})
@@ -149,25 +107,17 @@ export class Neo4jStore {
         );
       });
 
-      // ── Step 2 & 3: MERGE File nodes + link to Repo ──
-      // Collect all unique file paths from chunks + adjacency list
       const allFilePaths = new Set<string>();
-      for (const chunk of chunks) {
-        allFilePaths.add(chunk.filePath);
-      }
+      for (const chunk of chunks) allFilePaths.add(chunk.filePath);
       for (const [src, deps] of Object.entries(adjacencyList)) {
         allFilePaths.add(src);
-        for (const dep of deps) {
-          allFilePaths.add(dep);
-        }
+        for (const dep of deps) allFilePaths.add(dep);
       }
 
-      // Batch MERGE file nodes
       const filePathArray = [...allFilePaths];
       for (let i = 0; i < filePathArray.length; i += BATCH_SIZE) {
         const batch = filePathArray.slice(i, i + BATCH_SIZE);
         await session.executeWrite(async (tx: ManagedTransaction) => {
-          // UNWIND batches file nodes into a single Cypher operation
           await tx.run(
             `UNWIND $paths AS path
              MERGE (f:File {path: path})
@@ -179,10 +129,8 @@ export class Neo4jStore {
           );
         });
       }
-
       logger.debug(LOG_CTX, `  Merged ${filePathArray.length} File nodes`);
 
-      // ── Step 4 & 5: MERGE Chunk nodes + BELONGS_TO edges ──
       const chunkData = chunks.map((c) => ({
         id: c.id,
         repoId,
@@ -218,15 +166,11 @@ export class Neo4jStore {
           );
         });
       }
-
       logger.debug(LOG_CTX, `  Merged ${chunks.length} Chunk nodes`);
 
-      // ── Step 6: File-level IMPORTS edges ──
       const importEdges: { source: string; target: string }[] = [];
       for (const [src, deps] of Object.entries(adjacencyList)) {
-        for (const dep of deps) {
-          importEdges.push({ source: src, target: dep });
-        }
+        for (const dep of deps) importEdges.push({ source: src, target: dep });
       }
 
       for (let i = 0; i < importEdges.length; i += BATCH_SIZE) {
@@ -241,13 +185,8 @@ export class Neo4jStore {
           );
         });
       }
-
       logger.debug(LOG_CTX, `  Created ${importEdges.length} IMPORTS edges`);
 
-      // ── Step 7: Chunk-level CALLS edges (inferred) ──
-      // If chunk A is in file X and file X imports file Y, and chunk B is in file Y,
-      // we create a (chunk A)-[:CALLS]->(chunk B) edge.
-      // This is a heuristic — a more precise analysis would check call expressions.
       await session.executeWrite(async (tx: ManagedTransaction) => {
         await tx.run(
           `MATCH (c1:Chunk)-[:BELONGS_TO]->(f1:File)-[:IMPORTS]->(f2:File)<-[:BELONGS_TO]-(c2:Chunk)
@@ -263,12 +202,6 @@ export class Neo4jStore {
     }
   }
 
-  // ─── Hash Retrieval ────────────────────────────────────────────────────────
-
-  /**
-   * Retrieves stored chunk hashes from Neo4j for the diff engine.
-   * Complementary to Qdrant's hash retrieval — either can be authoritative.
-   */
   async getStoredHashes(repoId: string): Promise<Map<string, string>> {
     const session = this.getSession();
     const hashes = new Map<string, string>();
@@ -277,8 +210,7 @@ export class Neo4jStore {
       const result = await session.executeRead(
         async (tx: ManagedTransaction) => {
           return tx.run(
-            `MATCH (c:Chunk {repoId: $repoId})
-           RETURN c.id AS id, c.hash AS hash`,
+            `MATCH (c:Chunk {repoId: $repoId}) RETURN c.id AS id, c.hash AS hash`,
             { repoId },
           );
         },
@@ -287,9 +219,7 @@ export class Neo4jStore {
       for (const record of result.records) {
         const id = record.get("id") as string | null;
         const hash = record.get("hash") as string | null;
-        if (id && hash) {
-          hashes.set(id, hash);
-        }
+        if (id && hash) hashes.set(id, hash);
       }
     } finally {
       await session.close();
@@ -298,25 +228,6 @@ export class Neo4jStore {
     return hashes;
   }
 
-  // ─── Structural Neighbor Query (for Hybrid Search) ─────────────────────────
-
-  /**
-   * Given a set of chunk IDs (the primary vector matches), finds their
-   * 1st and 2nd degree structural neighbors in the graph.
-   *
-   * Traversal pattern:
-   *   (matched chunk)─[:BELONGS_TO]─>(file)─[:IMPORTS]─>(neighbor file)
-   *                                                       │
-   *                                    ┌──────────────────┘
-   *                                    ▼
-   *                            (neighbor chunk)─[:BELONGS_TO]─>(2nd-degree file)
-   *                                                              │
-   *                                              ┌───────────────┘
-   *                                              ▼
-   *                                     (2nd-degree chunk)
-   *
-   * Returns chunk IDs (deduplicated, excluding the input set).
-   */
   async findStructuralNeighbors(
     chunkIds: string[],
     repoId: string,
@@ -328,27 +239,13 @@ export class Neo4jStore {
     try {
       const result = await session.executeRead(
         async (tx: ManagedTransaction) => {
-          // This Cypher query traverses up to 2nd-degree neighbors:
-          //
-          // 1st degree: chunks in files that are imported by, or import,
-          //             the files containing the matched chunks.
-          //
-          // 2nd degree: extend one more IMPORTS hop.
-          //
-          // The variable-length relationship [:IMPORTS*1..maxDepth] handles both.
           return tx.run(
-            `// Find files containing the matched chunks
-           MATCH (matchedChunk:Chunk)-[:BELONGS_TO]->(sourceFile:File)
+            `MATCH (matchedChunk:Chunk)-[:BELONGS_TO]->(sourceFile:File)
            WHERE matchedChunk.id IN $chunkIds AND matchedChunk.repoId = $repoId
-
-           // Traverse 1..N degree IMPORTS in either direction
            MATCH (sourceFile)-[:IMPORTS*1..${maxDepth}]-(neighborFile:File)
-
-           // Collect chunks that belong to those neighbor files
            MATCH (neighborChunk:Chunk)-[:BELONGS_TO]->(neighborFile)
            WHERE neighborChunk.repoId = $repoId
              AND NOT neighborChunk.id IN $chunkIds
-
            RETURN DISTINCT neighborChunk.id AS neighborId`,
             { chunkIds, repoId },
           );
@@ -363,29 +260,20 @@ export class Neo4jStore {
         LOG_CTX,
         `Found ${neighborIds.length} structural neighbors for ${chunkIds.length} seed chunks`,
       );
-
       return neighborIds;
     } finally {
       await session.close();
     }
   }
 
-  // ─── Deletion ──────────────────────────────────────────────────────────────
-
-  /**
-   * Removes stale chunk nodes and their relationships.
-   */
   async deleteChunks(chunkIds: string[]): Promise<void> {
     if (chunkIds.length === 0) return;
 
     const session = this.getSession();
     try {
       await session.executeWrite(async (tx: ManagedTransaction) => {
-        // DETACH DELETE removes the node and all its relationships
         await tx.run(
-          `MATCH (c:Chunk)
-           WHERE c.id IN $chunkIds
-           DETACH DELETE c`,
+          `MATCH (c:Chunk) WHERE c.id IN $chunkIds DETACH DELETE c`,
           { chunkIds },
         );
       });
@@ -398,66 +286,32 @@ export class Neo4jStore {
     }
   }
 
-  // ─── Teardown ──────────────────────────────────────────────────────────────
-
-  /**
-   * Drops all data for a specific repo.
-   *
-   * ★ FIX: The previous implementation used an unbounded variable-length
-   *   traversal `OPTIONAL MATCH (r)-[*]->(n)`, which causes Neo4j to expand
-   *   every possible path from the root node.  On large repos this creates
-   *   an exponential Cartesian product that exhausts the transaction memory
-   *   budget (`dbms.memory.transaction.total.max`) and causes a 40-second
-   *   hang followed by a hard error.
-   *
-   *   The corrected approach deletes in three focused, label-anchored steps
-   *   that never do cross-product expansion:
-   *     1. Delete all :Chunk nodes for this repo (uses the chunk_repo_index).
-   *     2. Delete all :File nodes for this repo.
-   *     3. Delete the :Repo root node.
-   *
-   *   Each step uses CALL { ... } IN TRANSACTIONS to process in batches of
-   *   500, preventing any single transaction from blowing the memory limit.
-   */
   async dropRepo(repoId: string): Promise<void> {
     const session = this.getSession();
     try {
-      // Step 1: Delete all Chunk nodes belonging to this repo (batched).
-      // Uses the chunk_repo_index — no cross-product expansion.
       await session.run(
         `MATCH (c:Chunk {repoId: $repoId})
          CALL { WITH c DETACH DELETE c } IN TRANSACTIONS OF 500 ROWS`,
         { repoId },
       );
-
-      // Step 2: Delete all File nodes that belong to this repo (batched).
       await session.run(
         `MATCH (f:File {repoId: $repoId})
          CALL { WITH f DETACH DELETE f } IN TRANSACTIONS OF 500 ROWS`,
         { repoId },
       );
-
-      // Step 3: Delete the Repo root node itself.
       await session.run(`MATCH (r:Repo {id: $repoId}) DETACH DELETE r`, {
         repoId,
       });
-
       logger.warn(LOG_CTX, `Dropped all graph data for repo="${repoId}"`);
     } finally {
       await session.close();
     }
   }
 
-  /**
-   * Closes the Neo4j driver connection pool.
-   * Call this on server shutdown.
-   */
   async close(): Promise<void> {
     await this.driver.close();
     logger.info(LOG_CTX, "Neo4j driver closed");
   }
-
-  // ─── Private Helpers ───────────────────────────────────────────────────────
 
   private getSession(): Session {
     return this.driver.session({ database: this.database });
