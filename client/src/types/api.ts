@@ -47,6 +47,22 @@ export interface Finding {
 export interface FindingCard {
   finding: Finding;
   fixedCode: string;
+  /** The narrow code window that was actually analysed / sent to the LLM */
+  vulnerableWindow?: {
+    code: string;
+    startLine: number;
+    endLine: number;
+  };
+  /** Which fix strategy was used (windowed-diff, architectural-warning, etc.) */
+  fixStrategy?:
+    | "windowed-diff"
+    | "bounded-rewrite-full"
+    | "bounded-rewrite-truncated"
+    | "architectural-warning"
+    | "error-fallback"
+    | "fallback";
+  /** True when the finding was too large/structural for auto-fix */
+  isArchitecturalWarning?: boolean;
   explanations: {
     junior: string;
     senior: string;

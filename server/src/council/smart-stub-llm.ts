@@ -468,6 +468,9 @@ function buildSynthesisToolCalls(
     codeSnippet?: string;
     description?: string;
     category?: string;
+    startLine?: number;
+    endLine?: number;
+    filePath?: string;
   }> = [];
   try {
     const parsed = JSON.parse(userContent);
@@ -479,12 +482,22 @@ function buildSynthesisToolCalls(
   const calls: ToolCall[] = [];
   for (const f of findingsData.slice(0, 5)) {
     if (hasTool(tools, "generate_fixed_code_snippet")) {
+      // ★ Pass ALL required parameters so the tool can choose the correct
+      //   fix strategy (windowed diff / architectural warning / bounded rewrite).
+      //   Previously only originalCode + findingDescription were passed,
+      //   which caused Tier 2 (architectural bypass) to never trigger.
+      const lang = inferLanguageFromPath(f.filePath ?? "");
       calls.push({
         id: uuidv4(),
         name: "generate_fixed_code_snippet",
         arguments: {
           originalCode: f.codeSnippet ?? "",
           findingDescription: f.description ?? f.category ?? "code issue",
+          findingCategory: f.category ?? "",
+          chunkStartLine: f.startLine ?? 1,
+          vulnStartLine: f.startLine ?? 0,
+          vulnEndLine: f.endLine ?? 0,
+          language: lang,
         },
       });
     }
@@ -500,6 +513,23 @@ function buildSynthesisToolCalls(
     }
   }
   return calls;
+}
+
+/** Infer programming language from file path extension */
+function inferLanguageFromPath(filePath: string): string {
+  const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
+  const langMap: Record<string, string> = {
+    ts: "typescript",
+    tsx: "typescript",
+    js: "javascript",
+    jsx: "javascript",
+    py: "python",
+    rb: "ruby",
+    go: "go",
+    rs: "rust",
+    java: "java",
+  };
+  return langMap[ext] ?? "typescript";
 }
 
 // ── Test Coverage ────────────────────────────────────────────────────────────
@@ -975,11 +1005,24 @@ function buildFindingCards(
     let fixedCode = "";
     try {
       const parsed = JSON.parse(fixResult);
-      fixedCode = parsed.fixedCode ?? parsed.code ?? fixResult;
+      fixedCode = parsed.fixedCode ?? parsed.code ?? "";
     } catch {
+      fixedCode = fixResult ?? "";
+    }
+
+    // ★ NEVER allow empty / "[]" / "undefined" through — always provide
+    //   a meaningful fallback so the Monaco diff viewer never breaks.
+    if (
+      !fixedCode ||
+      fixedCode.trim() === "" ||
+      fixedCode.trim() === "[]" ||
+      fixedCode.trim() === "undefined" ||
+      fixedCode.trim() === "null"
+    ) {
       fixedCode =
-        fixResult ||
-        `// Fixed version of: ${f.title ?? "issue"}\n// TODO: Apply recommended fix`;
+        `// ⚠️ Auto-fix generation was not available for: ${f.title ?? "this issue"}\n` +
+        `// ${(f.description ?? "").slice(0, 200)}\n` +
+        `// Please review the finding details and refactor manually.`;
     }
 
     let references: Array<{ title: string; url: string }> = [];

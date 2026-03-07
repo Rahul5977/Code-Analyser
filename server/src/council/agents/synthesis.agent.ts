@@ -206,7 +206,14 @@ export async function runSynthesisAgent(
       filePath: f.filePath,
       startLine: f.startLine,
       endLine: f.endLine,
-      codeSnippet: f.codeSnippet.slice(0, 800),
+      // ★ Send the FULL codeSnippet — DO NOT truncate.
+      // The generate_fixed_code_snippet tool needs the real line count to
+      // correctly choose between windowed-diff / architectural-warning /
+      // bounded-rewrite.  Truncating to 800 chars caused the tool to
+      // see ~15 lines instead of ~271, bypassing the architectural guardrail
+      // and producing a broken diff.  The tool internally caps what it sends
+      // to the LLM (MAX_LLM_LINES = 60), so token overflow is already handled.
+      codeSnippet: f.codeSnippet,
       critiqueVerdict: f.critiqueVerdict,
     }));
 
@@ -262,7 +269,7 @@ function parseCards(
       references?: Array<{ title?: string; url?: string }>;
     }>;
 
-    if (!Array.isArray(parsed))
+    if (!Array.isArray(parsed) || parsed.length === 0)
       return originalFindings.map(generateFallbackCard);
 
     const findingMap = new Map(originalFindings.map((f) => [f.id, f]));
@@ -291,12 +298,39 @@ function parseCards(
         };
       }
 
+      // ★ Harden fixedCode — NEVER allow empty, "[]", or undefined through
+      //   to the diff viewer.  Detect strategy from the fix content.
+      let fixedCode =
+        entry.fixedCode ?? "// Fix generation failed — please review manually.";
+
+      // Guard against LLM returning literal "[]" or empty string
+      if (
+        !fixedCode ||
+        fixedCode.trim() === "" ||
+        fixedCode.trim() === "[]" ||
+        fixedCode.trim() === "undefined" ||
+        fixedCode.trim() === "null"
+      ) {
+        fixedCode =
+          `// ⚠️ Auto-fix generation was not available for this finding.\n` +
+          `// Issue: ${finding.description.slice(0, 200)}\n` +
+          `// Please review and fix this issue manually.`;
+      }
+
+      // Detect fix strategy from the content
+      const isArchitecturalWarning = fixedCode.includes(
+        "ARCHITECTURAL REFACTOR REQUIRED",
+      );
+      const fixStrategy: FindingCard["fixStrategy"] = isArchitecturalWarning
+        ? "architectural-warning"
+        : undefined;
+
       cards.push({
         finding,
-        fixedCode:
-          entry.fixedCode ??
-          "// Fix generation failed — please review manually.",
+        fixedCode,
         vulnerableWindow,
+        fixStrategy,
+        isArchitecturalWarning,
         explanations: {
           junior:
             entry.explanations?.junior ??

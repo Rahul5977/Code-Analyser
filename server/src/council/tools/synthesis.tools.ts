@@ -121,6 +121,7 @@ function generateArchitecturalWarningStub(
   startLine: number,
   endLine: number,
   codeLines: number,
+  cyclomaticComplexity?: number,
 ): string {
   const lineSpan = endLine - startLine + 1;
 
@@ -169,6 +170,9 @@ function generateArchitecturalWarningStub(
     `//`,
     `// This chunk is too large (${codeLines} lines, L${startLine}–L${endLine}) to safely auto-fix.`,
     `// Category: ${category}`,
+    ...(cyclomaticComplexity != null
+      ? [`// Cyclomatic Complexity: ${cyclomaticComplexity}`]
+      : []),
     `// ${description.slice(0, 200)}${description.length > 200 ? "…" : ""}`,
     `//`,
     `// ── Recommended Actions ──────────────────────────────────────`,
@@ -327,6 +331,11 @@ export function createGenerateFixedCodeSnippetTool(
       // ─────────────────────────────────────────────────────────────
       // TIER 2: Architectural Warning  (checked FIRST because it
       // short-circuits without an LLM call — saves time & tokens)
+      //
+      // Triggers when EITHER:
+      //   a) The finding's vulnerability span exceeds the threshold, OR
+      //   b) The full chunk itself exceeds the threshold
+      // AND the finding is structural in nature.
       // ─────────────────────────────────────────────────────────────
       const isStructuralCategory = STRUCTURAL_CATEGORIES.has(findingCategory);
       // Also detect structural patterns from the description text
@@ -336,9 +345,25 @@ export function createGenerateFixedCodeSnippetTool(
         /cyclomatic complexity/i.test(descLower) ||
         /too many (lines|params|parameters)/i.test(descLower) ||
         /god (class|module|function)/i.test(descLower) ||
-        /callback hell/i.test(descLower);
+        /callback hell/i.test(descLower) ||
+        /high.complexity/i.test(descLower);
 
-      if (vulnSpan > ARCHITECTURAL_WARNING_LINE_THRESHOLD && looksStructural) {
+      // ★ Use the LARGER of vulnSpan and codeLines.length for the size check.
+      //   This prevents the bypass from being skipped when line numbers are
+      //   missing (vulnStartLine=0, vulnEndLine=0) and the code was truncated.
+      const effectiveSpan = Math.max(vulnSpan, codeLines.length);
+
+      if (
+        effectiveSpan > ARCHITECTURAL_WARNING_LINE_THRESHOLD &&
+        looksStructural
+      ) {
+        // ★ Extract complexity number from description if available
+        //   e.g., "Function has cyclomatic complexity of 60 (threshold: 10)"
+        const ccMatch = findingDescription.match(
+          /complexity\s*(?:of|:)\s*(\d+)/i,
+        );
+        const ccValue = ccMatch ? parseInt(ccMatch[1]!, 10) : undefined;
+
         const stub = generateArchitecturalWarningStub(
           findingCategory || "structural-issue",
           findingDescription,
@@ -346,6 +371,7 @@ export function createGenerateFixedCodeSnippetTool(
           vulnStartLine || chunkStartLine,
           vulnEndLine || chunkStartLine + codeLines.length - 1,
           codeLines.length,
+          ccValue,
         );
 
         return JSON.stringify({

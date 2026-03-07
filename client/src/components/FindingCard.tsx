@@ -226,6 +226,16 @@ export function FindingCard({ card, index }: FindingCardProps) {
                   <span className="text-xs font-medium text-text-muted flex items-center gap-2">
                     <FileCode2 size={12} />
                     Code Diff — Original → Fixed
+                    {card.isArchitecturalWarning && (
+                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                        ⚠️ Architectural Refactor
+                      </span>
+                    )}
+                    {card.fixStrategy && !card.isArchitecturalWarning && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono text-text-muted/60">
+                        {card.fixStrategy}
+                      </span>
+                    )}
                   </span>
                   <span className="text-xs text-text-muted font-mono">
                     {language}
@@ -236,8 +246,14 @@ export function FindingCard({ card, index }: FindingCardProps) {
                   <DiffEditor
                     height="280px"
                     language={language}
-                    original={finding.codeSnippet}
-                    modified={card.fixedCode}
+                    original={
+                      // ★ Use the narrow vulnerable window as the "original"
+                      // side when available, so the diff viewer shows a
+                      // focused comparison instead of the full 271-line
+                      // chunk vs a 2-line comment stub.
+                      card.vulnerableWindow?.code || finding.codeSnippet || ""
+                    }
+                    modified={card.fixedCode || "// No fix available"}
                     theme="vs-dark"
                     options={{
                       readOnly: true,
