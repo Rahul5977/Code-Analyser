@@ -402,18 +402,46 @@ export class Neo4jStore {
 
   /**
    * Drops all data for a specific repo.
+   *
+   * ★ FIX: The previous implementation used an unbounded variable-length
+   *   traversal `OPTIONAL MATCH (r)-[*]->(n)`, which causes Neo4j to expand
+   *   every possible path from the root node.  On large repos this creates
+   *   an exponential Cartesian product that exhausts the transaction memory
+   *   budget (`dbms.memory.transaction.total.max`) and causes a 40-second
+   *   hang followed by a hard error.
+   *
+   *   The corrected approach deletes in three focused, label-anchored steps
+   *   that never do cross-product expansion:
+   *     1. Delete all :Chunk nodes for this repo (uses the chunk_repo_index).
+   *     2. Delete all :File nodes for this repo.
+   *     3. Delete the :Repo root node.
+   *
+   *   Each step uses CALL { ... } IN TRANSACTIONS to process in batches of
+   *   500, preventing any single transaction from blowing the memory limit.
    */
   async dropRepo(repoId: string): Promise<void> {
     const session = this.getSession();
     try {
-      await session.executeWrite(async (tx: ManagedTransaction) => {
-        await tx.run(
-          `MATCH (r:Repo {id: $repoId})
-           OPTIONAL MATCH (r)-[*]->(n)
-           DETACH DELETE r, n`,
-          { repoId },
-        );
+      // Step 1: Delete all Chunk nodes belonging to this repo (batched).
+      // Uses the chunk_repo_index — no cross-product expansion.
+      await session.run(
+        `MATCH (c:Chunk {repoId: $repoId})
+         CALL { WITH c DETACH DELETE c } IN TRANSACTIONS OF 500 ROWS`,
+        { repoId },
+      );
+
+      // Step 2: Delete all File nodes that belong to this repo (batched).
+      await session.run(
+        `MATCH (f:File {repoId: $repoId})
+         CALL { WITH f DETACH DELETE f } IN TRANSACTIONS OF 500 ROWS`,
+        { repoId },
+      );
+
+      // Step 3: Delete the Repo root node itself.
+      await session.run(`MATCH (r:Repo {id: $repoId}) DETACH DELETE r`, {
+        repoId,
       });
+
       logger.warn(LOG_CTX, `Dropped all graph data for repo="${repoId}"`);
     } finally {
       await session.close();

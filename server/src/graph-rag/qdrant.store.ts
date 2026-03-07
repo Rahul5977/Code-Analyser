@@ -331,6 +331,34 @@ export class QdrantStore {
     });
   }
 
+  /**
+   * Drops ALL vectors for a given repoId using a single Qdrant filter-based
+   * delete.  This replaces the previous getStoredHashes() + deleteChunks()
+   * N+1 pattern, which issued thousands of individual deletes for large repos.
+   *
+   * Qdrant's `delete` endpoint accepts a `filter` object — no IDs needed.
+   */
+  async deleteByRepoId(repoId: string): Promise<void> {
+    logger.info(LOG_CTX, `Deleting all vectors for repoId="${repoId}"…`);
+    try {
+      await this.client.delete(this.collectionName, {
+        wait: true,
+        filter: {
+          must: [{ key: "repoId", match: { value: repoId } }],
+        },
+      });
+      logger.info(LOG_CTX, `Deleted all vectors for repoId="${repoId}"`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // If the collection doesn't exist (e.g., first run with no data), log
+      // and continue — this is not a fatal error during cleanup.
+      logger.warn(
+        LOG_CTX,
+        `deleteByRepoId failed for repoId="${repoId}" (collection may not exist): ${msg}`,
+      );
+    }
+  }
+
   // ─── Teardown ──────────────────────────────────────────────────────────────
 
   /**

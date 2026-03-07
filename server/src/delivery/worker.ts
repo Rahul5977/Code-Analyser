@@ -175,6 +175,41 @@ async function deliverWebhook(
 
 // ─── Cleanup Functions ───────────────────────────────────────────────────────
 
+/**
+ * Wraps any cleanup promise in a hard timeout so that a single hung
+ * database call never blocks the entire `finally` block.
+ *
+ * If the operation times out, it logs a warning and resolves (never rejects)
+ * so that subsequent cleanup steps still execute.
+ */
+async function withCleanupTimeout<T>(
+  label: string,
+  timeoutMs: number,
+  fn: () => Promise<T>,
+): Promise<T | undefined> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      logger.warn(
+        LOG_CTX,
+        `[cleanup:${label}] Timed out after ${timeoutMs}ms — skipping`,
+      );
+      resolve(undefined);
+    }, timeoutMs);
+
+    fn()
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((err: unknown) => {
+        clearTimeout(timer);
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(LOG_CTX, `[cleanup:${label}] Error: ${msg}`);
+        resolve(undefined);
+      });
+  });
+}
+
 async function cleanupDisk(jobId: string): Promise<void> {
   const repoDir = path.join(TEMP_DIR, jobId);
   try {
@@ -209,27 +244,25 @@ async function cleanupQdrant(
 
 async function cleanupNeo4j(
   service: GraphRagService | null,
-  jobId: string,
+  // ★ FIX Bug 2: Accept repoId (not jobId).
+  // The graph data was stored under repoId (e.g. "owner/repo"), NOT the
+  // BullMQ jobId UUID.  Passing jobId here previously caused the cleanup
+  // to match nothing in Neo4j, leaking the full graph on every job.
+  repoId: string,
 ): Promise<void> {
   try {
     if (service) {
-      // Use the Neo4j store's driver to run a raw cleanup query
-      // The Neo4jStore.dropRepo already handles this; but for the explicit
-      // Cypher query `MATCH (n {jobId}) DETACH DELETE n` we call dropRepo
-      // which internally runs the equivalent.
-      // If a more granular query is needed, we can access the store directly:
-      const neo4j = service.neo4j;
-      await neo4j.dropRepo(jobId);
+      await service.neo4j.dropRepo(repoId);
       logger.info(
         LOG_CTX,
-        `[cleanup:neo4j] Deleted graph nodes for jobId=${jobId}`,
+        `[cleanup:neo4j] Deleted graph nodes for repoId=${repoId}`,
       );
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error(
       LOG_CTX,
-      `[cleanup:neo4j] Failed to delete graph for jobId=${jobId}: ${msg}`,
+      `[cleanup:neo4j] Failed to delete graph for repoId=${repoId}: ${msg}`,
     );
   }
 }
@@ -378,24 +411,46 @@ export function createAnalysisWorker(): Worker {
         // ────────────────────────────────────────────────────────────────
         // THE ULTIMATE CLEANUP BLOCK
         //
-        // Every step is independently try/caught so that a failure in one
-        // (e.g., disk permissions) never prevents the others from running.
+        // Every step is independently wrapped in:
+        //   a) its own try/catch, so a failure in one never skips the rest.
+        //   b) withCleanupTimeout(), so a hung DB call (e.g., Neo4j OOM)
+        //      never blocks the worker indefinitely.
+        //
+        // Timeout budget per step:
+        //   Disk   →  5 s  (local fs, should be instant)
+        //   Qdrant → 10 s  (HTTP delete call)
+        //   Neo4j  → 15 s  (Cypher delete, batched — much faster now)
+        //   Close  →  5 s  (driver pool teardown)
         // ────────────────────────────────────────────────────────────────
 
         logger.info(LOG_CTX, `[finally] Starting cleanup for job=${jobId}`);
         await publishProgress(jobId, "job:cleanup:start", "Starting cleanup…");
 
         // Step 1: Disk cleanup — rm -rf /temp/<jobId>
-        await cleanupDisk(jobId);
+        await withCleanupTimeout("disk", 5_000, () => cleanupDisk(jobId));
 
         // Step 2: Vector DB cleanup — drop Qdrant data for this repo
-        await cleanupQdrant(graphRagService, repoId);
+        // ★ NOTE: cleanupQdrant internally calls graphRagService.dropRepo()
+        //   which also deletes Neo4j data.  We call cleanupNeo4j separately
+        //   below because graphRagService.dropRepo() may have already handled
+        //   it — Neo4j.dropRepo is idempotent (MATCH will simply find nothing).
+        await withCleanupTimeout("qdrant", 10_000, () =>
+          cleanupQdrant(graphRagService, repoId),
+        );
 
-        // Step 3: Graph DB cleanup — MATCH (n {jobId}) DETACH DELETE n
-        await cleanupNeo4j(graphRagService, jobId);
+        // Step 3: Graph DB cleanup — label-anchored batched DELETE (no [*])
+        // ★ FIX Bug 2: pass repoId (not jobId) — this is the key the graph
+        //   was stored under.  Passing jobId previously deleted nothing and
+        //   caused a full graph leak on every job completion.
+        await withCleanupTimeout("neo4j", 15_000, () =>
+          cleanupNeo4j(graphRagService, repoId),
+        );
 
         // Step 4: Close GraphRAG service connections
-        try {
+        // ★ FIX Bug 3: close() runs AFTER all delete operations, not before.
+        //   Previously if Neo4j cleanup was slow, close() could race with it
+        //   leaving the driver in a partially-closed state.
+        await withCleanupTimeout("connections", 5_000, async () => {
           if (graphRagService) {
             await graphRagService.close();
             logger.info(
@@ -403,13 +458,7 @@ export function createAnalysisWorker(): Worker {
               `[cleanup:connections] GraphRAG connections closed for job=${jobId}`,
             );
           }
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.error(
-            LOG_CTX,
-            `[cleanup:connections] Failed to close GraphRAG: ${msg}`,
-          );
-        }
+        });
 
         // Step 5: Emit terminal event → SSE endpoint closes the stream
         await publishProgress(

@@ -368,20 +368,26 @@ export class GraphRagService {
 
   /**
    * Drops all stored data (vectors + graph) for a specific repository.
+   *
+   * ★ FIX: The previous implementation called getStoredHashes() to fetch
+   *   every chunk ID and then deleted them one-by-one via deleteChunks().
+   *   For large repos (1000s of vectors) this meant N+1 Qdrant round-trips.
+   *
+   *   We now call qdrant.deleteByRepoId() which issues a single Qdrant
+   *   filter-based delete (`DELETE WHERE payload.repoId = $repoId`), and
+   *   neo4j.dropRepo() which uses label-anchored batched Cypher — no
+   *   unbounded [*] traversal.
+   *
+   *   Both operations are run in parallel since they are independent.
    */
   async dropRepo(repoId: string): Promise<void> {
     await this.ensureInitialised();
     logger.warn(LOG_CTX, `Dropping all data for repo="${repoId}"…`);
 
-    // Fetch all chunk IDs for the repo, then delete from Qdrant
-    const hashes = await this.qdrant.getStoredHashes(repoId);
-    const allChunkIds = [...hashes.keys()];
-    if (allChunkIds.length > 0) {
-      await this.qdrant.deleteChunks(allChunkIds);
-    }
-
-    // Drop from Neo4j
-    await this.neo4j.dropRepo(repoId);
+    await Promise.all([
+      this.qdrant.deleteByRepoId(repoId),
+      this.neo4j.dropRepo(repoId),
+    ]);
 
     logger.info(LOG_CTX, `All data dropped for repo="${repoId}"`);
   }
