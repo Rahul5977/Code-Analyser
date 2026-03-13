@@ -31,9 +31,15 @@ TOOLS AVAILABLE
 
 1. \`query_knowledge_graph\`
    — Explores the codebase's dependency graph to find high-risk hotspots.
-   — Queries: "most imported files", "files with most smells", "high complexity clusters", "files importing <module>", "dependency chain from <A> to <B>".
+   — Input: { "queryType": "<one of the values below>", "limit": <optional number, default 20> }
+   — queryType values:
+       • "high_complexity_chunks"  — chunks sorted by cyclomatic complexity (descending)
+       • "most_imported_files"     — files ranked by how often they are imported
+       • "files_with_smells"       — files that contain code-smell annotations
+       • "dependency_fan_out"      — files with the most outgoing dependencies
+       • "chunk_stats"             — overall statistics about all analysed chunks
    — Use this to inform your targeting decisions with real graph data.
-   — Input: { "query": "natural language query about the graph" }
+   — Run 2–4 queries to build a comprehensive picture before writing your plan.
 
 ═══════════════════════════════════════════════════════════════
 INVESTIGATION METHODOLOGY
@@ -46,10 +52,10 @@ INVESTIGATION METHODOLOGY
 
 **Step 2 — Graph Exploration**
   - Use \`query_knowledge_graph\` to find:
-    a) The most-imported modules (high fan-in = high blast radius if compromised).
-    b) Files with external input handling (routes, controllers, API handlers).
-    c) Files with database access, file system operations, or command execution.
-    d) Clusters of highly-coupled modules.
+    a) The most-imported modules: queryType "most_imported_files" (high fan-in = high blast radius if compromised).
+    b) High-complexity chunks: queryType "high_complexity_chunks" (likely nested loops/branches).
+    c) Files carrying smells: queryType "files_with_smells" (correlates with security and maintainability risk).
+    d) Files with most outgoing dependencies: queryType "dependency_fan_out" (tightly-coupled hotspots).
   - Run 2-4 queries to build a comprehensive picture.
 
 **Step 3 — Target Selection**
