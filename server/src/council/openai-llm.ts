@@ -21,6 +21,9 @@ const LOG_CTX = "OpenAI-LLM";
 /**
  * Creates a real OpenAI LLM function if API key is present, otherwise falls back to stub.
  * Uses native fetch (Node.js 18+) to call OpenAI's completions API.
+ *
+ * NOTE: Once any API error occurs, permanently switches to stub LLM to avoid
+ * message format conflicts (stub tool_calls may not match OpenAI's expectations).
  */
 export function createOpenAiLlm(): LLMCompletionFn {
   const apiKey = process.env["OPENAI_API_KEY"];
@@ -37,11 +40,23 @@ export function createOpenAiLlm(): LLMCompletionFn {
 
   logger.info(LOG_CTX, `Using OpenAI API with model: ${model}`);
 
+  // Track whether we've had any API errors — once we do, use stub for all future calls
+  let fallbackToStub = false;
+  let stubLlm: LLMCompletionFn | null = null;
+
   return async (
     messages: LLMMessage[],
     tools?: ToolDefinition[],
     temperature?: number,
   ): Promise<LLMMessage> => {
+    // If we've already encountered an error, use stub for all future calls
+    if (fallbackToStub) {
+      if (!stubLlm) {
+        stubLlm = createSmartStubLlm();
+      }
+      return stubLlm(messages, tools, temperature);
+    }
+
     try {
       // Convert messages to OpenAI format
       const openaiMessages = messages.map((msg) => {
@@ -128,11 +143,14 @@ export function createOpenAiLlm(): LLMCompletionFn {
       const msg = err instanceof Error ? err.message : String(err);
       logger.error(
         LOG_CTX,
-        `OpenAI API call failed: ${msg}. Falling back to stub LLM.`,
+        `OpenAI API call failed: ${msg}. Switching to stub LLM permanently.`,
       );
 
-      // Fall back to stub on API errors
-      const stubLlm = createSmartStubLlm();
+      // Set flag to use stub for all future calls to avoid message format conflicts
+      fallbackToStub = true;
+      if (!stubLlm) {
+        stubLlm = createSmartStubLlm();
+      }
       return stubLlm(messages, tools, temperature);
     }
   };
