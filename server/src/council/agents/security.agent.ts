@@ -7,7 +7,7 @@
 //   1. fetch_chunk_with_context — hybrid retrieval
 //   2. check_cve_database      — OSV API lookup
 //   3. run_semgrep_rule        — SAST rule execution
-//   4. trace_data_flow         — AST-based taint tracking
+//   4. trace_data_flow         — heuristic/regex taint tracking
 //
 // Uses tools iteratively: fetch chunk → spot suspicious pattern →
 // trace data flow → cross-validate with Semgrep → produce finding.
@@ -48,14 +48,14 @@ TOOLS AVAILABLE
    — Input: { "packageName": "...", "version": "..." }
 
 3. \`run_semgrep_rule\`
-   — Executes a Semgrep SAST rule against code. Use ruleId "auto" for broad pattern matching.
+   — Executes a Semgrep SAST rule against code. Use ruleId "auto" for broad pattern matching (runs Semgrep's built-in auto-detection, not the registry).
    — Specific rule IDs: "sql-injection", "xss", "command-injection", "path-traversal", "ssrf", "hardcoded-secret", "insecure-crypto", "prototype-pollution".
    — Input: { "ruleId": "auto" | "<specific>", "code": "..." }
 
 4. \`trace_data_flow\`
-   — Traces the data flow of a variable: where it originates (source) and where it is consumed (sink).
+   — Traces the data flow of a variable using heuristic/regex pattern matching: where it originates (source) and where it is consumed (sink).
    — CRITICAL for confirming taint: a vulnerability is only exploitable if user-controlled data reaches a dangerous sink without sanitisation.
-   — Input: { "chunkId": "...", "variableName": "..." }
+   — Input: { "varName": "...", "code": "..." }
 
 ═══════════════════════════════════════════════════════════════
 INVESTIGATION METHODOLOGY (MANDATORY WORKFLOW)
@@ -225,10 +225,8 @@ function parseFindings(
   }>,
 ): Finding[] {
   try {
-    // Try extracting JSON array
-    let jsonStr = response;
-    const arrayMatch = jsonStr.match(/\[[\s\S]*\]/);
-    if (arrayMatch) jsonStr = arrayMatch[0];
+    const jsonStr = extractJsonArray(response);
+    if (!jsonStr) return [];
 
     const parsed = JSON.parse(jsonStr) as Array<Partial<Finding>>;
     if (!Array.isArray(parsed)) return [];
@@ -246,15 +244,117 @@ function parseFindings(
       endLine: f.endLine ?? 0,
       codeSnippet: f.codeSnippet ?? "",
       chunkIds: f.chunkIds ?? [],
-      evidence: evidence.map((e) => ({
-        toolName: e.toolName,
-        input: e.input,
-        output: e.output,
-        timestamp: e.timestamp,
-      })),
+      // Attach only evidence items relevant to this finding
+      evidence: filterEvidenceForFinding(f, evidence),
     }));
   } catch {
     logger.warn(LOG_CTX, "Failed to parse Security Agent response as JSON");
     return [];
   }
+}
+
+/**
+ * Extracts the first valid JSON array from a response string.
+ * Prefers content inside a fenced ```json block, then falls back to bracket
+ * matching so a greedy regex does not accidentally capture unintended text.
+ */
+function extractJsonArray(response: string): string | null {
+  // 1. Prefer fenced JSON code block: ```json\n[...]\n```
+  const fencedMatch = response.match(/```(?:json)?\s*(\[[\s\S]*?])\s*```/i);
+  if (fencedMatch?.[1]) {
+    return fencedMatch[1];
+  }
+
+  // 2. Walk the string to find the first balanced [ ... ] array
+  const start = response.indexOf("[");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < response.length; i++) {
+    const ch = response[i]!;
+
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === "[" || ch === "{") depth++;
+    else if (ch === "]" || ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return response.slice(start, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Returns the subset of evidence items that are relevant to a given finding.
+ *
+ * Relevance is determined by:
+ * 1. The evidence input references one of the finding's chunkIds.
+ * 2. The evidence input or output references the finding's filePath.
+ * 3. The evidence output contains text related to the finding's title/category.
+ *
+ * If no specific evidence matches, all evidence is returned so the finding
+ * always carries supporting data.
+ */
+function filterEvidenceForFinding(
+  finding: Partial<Finding>,
+  evidence: Array<{
+    toolName: string;
+    input: Record<string, unknown>;
+    output: string;
+    timestamp: string;
+  }>,
+): Array<{
+  toolName: string;
+  input: Record<string, unknown>;
+  output: string;
+  timestamp: string;
+}> {
+  if (evidence.length === 0) return [];
+
+  const chunkIds = new Set(finding.chunkIds ?? []);
+  const filePath = (finding.filePath ?? "").toLowerCase();
+  const category = (finding.category ?? "").toLowerCase();
+  const title = (finding.title ?? "").toLowerCase();
+
+  const relevant = evidence.filter((e) => {
+    // Check if any chunkId from the finding appears in the tool input
+    const inputStr = JSON.stringify(e.input).toLowerCase();
+    const outputStr = e.output.toLowerCase();
+
+    if (chunkIds.size > 0) {
+      for (const id of chunkIds) {
+        if (inputStr.includes(id.toLowerCase())) return true;
+      }
+    }
+
+    if (filePath && (inputStr.includes(filePath) || outputStr.includes(filePath))) {
+      return true;
+    }
+
+    if (category && outputStr.includes(category)) return true;
+    if (title && outputStr.includes(title)) return true;
+
+    return false;
+  });
+
+  // Fall back to all evidence if nothing matched — findings should never be bare
+  return relevant.length > 0 ? relevant : evidence;
 }
