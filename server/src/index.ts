@@ -43,7 +43,7 @@ import type {
   EmbedBatchFunction,
   CouncilConfig,
 } from "./interfaces";
-import { createSmartStubLlm } from "./council/smart-stub-llm";
+import { createOpenAiLlm } from "./council/openai-llm";
 
 const app = express();
 const PORT = process.env["PORT"] ?? 3001;
@@ -98,11 +98,11 @@ const stubEmbedBatchFn: EmbedBatchFunction = async (
   return Promise.all(texts.map((t) => stubEmbedFn(t)));
 };
 
-const stubLlmFn = createSmartStubLlm();
+const llmFn = createOpenAiLlm();
 
 function getCouncilConfig(): CouncilConfig {
   return {
-    llmFn: stubLlmFn,
+    llmFn,
     maxIterations: Number(process.env["COUNCIL_MAX_ITERATIONS"] ?? "10"),
     maxReinvestigations: Number(
       process.env["COUNCIL_MAX_REINVESTIGATIONS"] ?? "2",
@@ -301,14 +301,12 @@ app.post(
         "Server",
         `GraphRAG sync failed for jobId=${jobId}: ${message}`,
       );
-      res
-        .status(500)
-        .json({
-          success: false,
-          error: "GraphRAG Sync Failed",
-          message,
-          jobId,
-        });
+      res.status(500).json({
+        success: false,
+        error: "GraphRAG Sync Failed",
+        message,
+        jobId,
+      });
     }
   },
 );

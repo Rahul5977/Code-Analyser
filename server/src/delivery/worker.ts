@@ -49,8 +49,8 @@ interface AnalysisJobData {
   callbackUrl: string | null;
 }
 
-import { createSmartStubLlm } from "../council/smart-stub-llm";
-const stubLlmFn = createSmartStubLlm();
+import { createOpenAiLlm } from "../council/openai-llm";
+const llmFn = createOpenAiLlm();
 
 const stubEmbedFn: EmbedFunction = async (text: string): Promise<number[]> => {
   const dim = Number(process.env["EMBEDDING_DIM"] ?? "384");
@@ -90,7 +90,7 @@ function getGraphRagConfig(): GraphRagConfig {
 
 function getCouncilConfig(): CouncilConfig {
   return {
-    llmFn: stubLlmFn,
+    llmFn,
     maxIterations: Number(process.env["COUNCIL_MAX_ITERATIONS"] ?? "10"),
     maxReinvestigations: Number(
       process.env["COUNCIL_MAX_REINVESTIGATIONS"] ?? "2",

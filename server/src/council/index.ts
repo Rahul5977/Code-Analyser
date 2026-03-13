@@ -2,6 +2,10 @@
 // src/council/index.ts – Barrel export for Phase 4: LangGraph Council
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── LLM Providers ──
+export { createOpenAiLlm } from "./openai-llm";
+export { createSmartStubLlm } from "./smart-stub-llm";
+
 // ── Council Orchestrator (main entry point) ──
 export { runCouncil } from "./council.orchestrator";
 export type { CouncilDependencies } from "./council.orchestrator";
