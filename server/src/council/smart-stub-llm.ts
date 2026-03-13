@@ -386,6 +386,7 @@ function buildPerformanceComplexityCalls(
       /* ignore */
     }
   }
+  // Cap at 5 to avoid flooding the LLM context with too many tool results
   return calls.slice(0, 5);
 }
 
@@ -908,9 +909,11 @@ function buildArchitectureReport(toolResults: string[]): LLMMessage {
       const parsed = JSON.parse(result);
       // find_circular_dependencies returns { cycles: [{ files: [...], length }] }
       if (Array.isArray(parsed.cycles)) {
-        circularDependencies = parsed.cycles.map(
-          (c: { files?: string[] }) => c.files ?? c,
-        );
+        circularDependencies = parsed.cycles
+          .map((c: { files?: string[] }) => c.files)
+          .filter((files: string[] | undefined): files is string[] =>
+            Array.isArray(files),
+          );
       }
       // compute_coupling_score returns { topCoupledPairs: [...] }
       if (Array.isArray(parsed.topCoupledPairs))
