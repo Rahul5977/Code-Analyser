@@ -61,11 +61,26 @@ export function createOpenAiLlm(): LLMCompletionFn {
       // Convert messages to OpenAI format
       const openaiMessages = messages.map((msg) => {
         if (msg.role === "tool") {
-          // Tool messages in OpenAI format
           return {
             role: "tool" as const,
             tool_call_id: msg.toolCallId || "unknown",
             content: msg.content,
+          };
+        }
+        if (msg.role === "assistant" && msg.toolCalls && msg.toolCalls.length > 0) {
+          // Assistant messages with tool calls MUST include tool_calls for the
+          // OpenAI API to accept subsequent tool-result messages.
+          return {
+            role: "assistant" as const,
+            content: msg.content || null,
+            tool_calls: msg.toolCalls.map((tc) => ({
+              id: tc.id,
+              type: "function" as const,
+              function: {
+                name: tc.name,
+                arguments: JSON.stringify(tc.arguments),
+              },
+            })),
           };
         }
         return {
@@ -128,11 +143,24 @@ export function createOpenAiLlm(): LLMCompletionFn {
       }>;
 
       // Convert tool calls back to internal format
-      const parsedToolCalls: ToolCall[] = toolCalls.map((tc) => ({
-        id: tc.id,
-        name: tc.function.name,
-        arguments: JSON.parse(tc.function.arguments),
-      }));
+      const parsedToolCalls: ToolCall[] = toolCalls
+        .map((tc) => {
+          let parsedArgs: Record<string, unknown>;
+          try {
+            parsedArgs = JSON.parse(tc.function.arguments);
+          } catch {
+            logger.warn(
+              LOG_CTX,
+              `Failed to parse tool call arguments for "${tc.function.name}" — using empty args`,
+            );
+            parsedArgs = {};
+          }
+          return {
+            id: tc.id,
+            name: tc.function.name,
+            arguments: parsedArgs,
+          };
+        });
 
       return {
         role: "assistant",
