@@ -148,6 +148,13 @@ export async function executeReActLoop(
     for (const toolCall of response.toolCalls) {
       const tool = toolMap.get(toolCall.name);
       const callId = toolCall.id || uuidv4();
+      // Normalise id in-place: if the LLM didn't supply one, write the
+      // generated id back so the stored assistant message's toolCalls[].id
+      // always matches the tool_call_id of the corresponding tool-result
+      // message sent to the API on the next iteration.
+      if (!toolCall.id) {
+        toolCall.id = callId;
+      }
 
       if (!tool) {
         // Unknown tool — feed back an error

@@ -7,6 +7,7 @@
 // Provides a stateless LLMCompletionFn that integrates with the council agents.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { v4 as uuidv4 } from "uuid";
 import type {
   LLMMessage,
   LLMCompletionFn,
@@ -141,7 +142,7 @@ export function createOpenAiLlm(): LLMCompletionFn {
             parsedArgs = {};
           }
           return {
-            id: tc.id,
+            id: tc.id || uuidv4(),
             name: tc.function.name,
             arguments: parsedArgs,
           };
