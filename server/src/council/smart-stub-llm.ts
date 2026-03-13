@@ -63,8 +63,8 @@ function createSmartStubLlm(): LLMCompletionFn {
               id: uuidv4(),
               name: "query_knowledge_graph",
               arguments: {
-                query: "high complexity files with code smells",
-                topK: 20,
+                queryType: "high_complexity_chunks",
+                limit: 20,
               },
             },
           ],
@@ -91,11 +91,22 @@ function createSmartStubLlm(): LLMCompletionFn {
     // ── PERFORMANCE AGENT ─────────────────────────────────────────────────
     if (systemContent.includes("Performance Agent")) {
       if (assistantTurns === 0) {
-        const calls = buildPerformanceToolCalls(userContent, availableTools);
+        // Phase 1: Only fetch chunks — complexity estimation needs the code
+        const calls = buildPerformanceFetchCalls(userContent, availableTools);
         if (calls.length > 0)
           return { role: "assistant", content: "", toolCalls: calls };
       }
       if (assistantTurns === 1 && toolResults.length > 0) {
+        // Phase 2: Estimate complexity using code from fetched chunks
+        const calls = buildPerformanceComplexityCalls(
+          toolResults,
+          availableTools,
+        );
+        if (calls.length > 0)
+          return { role: "assistant", content: "", toolCalls: calls };
+      }
+      if (assistantTurns === 2 && toolResults.length > 0) {
+        // Phase 3: Search for similar anti-patterns if bad complexity found
         const calls = buildSimilarPatternCalls(toolResults, availableTools);
         if (calls.length > 0)
           return { role: "assistant", content: "", toolCalls: calls };
@@ -322,7 +333,8 @@ function buildSecurityTraceCalls(
 
 // ── Performance ──────────────────────────────────────────────────────────────
 
-function buildPerformanceToolCalls(
+/** Phase 1: Only fetch chunks — we need the code before estimating complexity */
+function buildPerformanceFetchCalls(
   userContent: string,
   tools: ToolDefinition[],
 ): ToolCall[] {
@@ -343,15 +355,38 @@ function buildPerformanceToolCalls(
         arguments: { chunkId },
       });
     }
-    if (hasTool(tools, "estimate_complexity_class")) {
+  }
+  return calls;
+}
+
+/** Phase 2: Extract code from fetch results, then call estimate_complexity_class with actual source code */
+function buildPerformanceComplexityCalls(
+  toolResults: string[],
+  tools: ToolDefinition[],
+): ToolCall[] {
+  const calls: ToolCall[] = [];
+  for (const result of toolResults) {
+    try {
+      const parsed = JSON.parse(result);
+      const code: string = parsed.code ?? parsed.chunk?.code ?? "";
+      if (!code || !hasTool(tools, "estimate_complexity_class")) continue;
+
       calls.push({
         id: uuidv4(),
         name: "estimate_complexity_class",
-        arguments: { chunkId },
+        arguments: {
+          code,
+          cyclomaticComplexity:
+            parsed.cyclomaticComplexity ??
+            parsed.chunk?.cyclomaticComplexity ??
+            0,
+        },
       });
+    } catch {
+      /* ignore */
     }
   }
-  return calls;
+  return calls.slice(0, 5);
 }
 
 function buildSimilarPatternCalls(
@@ -373,7 +408,7 @@ function buildSimilarPatternCalls(
           id: uuidv4(),
           name: "find_similar_patterns",
           arguments: {
-            codeSnippet: parsed.code ?? parsed.chunk?.code ?? "function()",
+            code: parsed.code ?? parsed.chunk?.code ?? "function()",
             topK: 5,
           },
         });
@@ -406,13 +441,13 @@ function buildArchitectureToolCalls(tools: ToolDefinition[]): ToolCall[] {
     calls.push({
       id: uuidv4(),
       name: "find_god_classes",
-      arguments: { threshold: 5 },
+      arguments: { minOutgoingEdges: 5 },
     });
   if (hasTool(tools, "detect_layer_violations"))
     calls.push({
       id: uuidv4(),
       name: "detect_layer_violations",
-      arguments: { layers: "auto" },
+      arguments: {},
     });
   return calls;
 }
@@ -871,8 +906,15 @@ function buildArchitectureReport(toolResults: string[]): LLMMessage {
   for (const result of toolResults) {
     try {
       const parsed = JSON.parse(result);
-      if (Array.isArray(parsed.cycles)) circularDependencies = parsed.cycles;
-      if (Array.isArray(parsed.topPairs)) couplingScores = parsed.topPairs;
+      // find_circular_dependencies returns { cycles: [{ files: [...], length }] }
+      if (Array.isArray(parsed.cycles)) {
+        circularDependencies = parsed.cycles.map(
+          (c: { files?: string[] }) => c.files ?? c,
+        );
+      }
+      // compute_coupling_score returns { topCoupledPairs: [...] }
+      if (Array.isArray(parsed.topCoupledPairs))
+        couplingScores = parsed.topCoupledPairs;
       if (Array.isArray(parsed.godClasses)) godClasses = parsed.godClasses;
       if (Array.isArray(parsed.violations)) layerViolations = parsed.violations;
     } catch {
