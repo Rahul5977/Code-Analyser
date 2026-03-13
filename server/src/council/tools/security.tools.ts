@@ -4,7 +4,7 @@
 // Security Agent Tools:
 //   1. check_cve_database    — queries OSV API for real CVE records
 //   2. run_semgrep_rule      — executes a Semgrep SAST rule via child process
-//   3. trace_data_flow       — AST-based data flow tracing for injection vectors
+//   3. trace_data_flow       — heuristic/regex data flow tracing for injection vectors
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { execFile } from "node:child_process";
@@ -180,9 +180,11 @@ export function createRunSemgrepRuleTool(): AgentTool {
         await fs.writeFile(tmpFile, code, "utf-8");
 
         try {
+          // "auto" uses Semgrep's built-in auto-detection; specific rule IDs use the registry (r/).
+          const configArg = ruleId === "auto" ? "auto" : `r/${ruleId}`;
           const { stdout } = await execFileAsync(
             "semgrep",
-            ["--config", `r/${ruleId}`, "--json", "--no-git-ignore", tmpFile],
+            ["--config", configArg, "--json", "--no-git-ignore", tmpFile],
             { timeout: 30_000 },
           );
 
@@ -331,17 +333,19 @@ function fallbackPatternScan(code: string, ruleId: string): string {
 // ─── trace_data_flow ─────────────────────────────────────────────────────────
 
 /**
- * AST-based data flow tracer. Traces where a variable comes from (source)
+ * Heuristic data flow tracer. Traces where a variable comes from (source)
  * and where it goes (sink). Critical for confirming injection vectors.
  *
- * This is a lightweight static analysis — not a full taint tracker, but
- * sufficient to identify user-controlled → dangerous-sink flows.
+ * This is a lightweight static analysis using regex pattern matching —
+ * not a full AST-based taint tracker, but sufficient to identify
+ * user-controlled → dangerous-sink flows within a code snippet.
  */
 export function createTraceDataFlowTool(): AgentTool {
   return {
     name: "trace_data_flow",
     description:
-      "Traces the data flow of a variable within a function chunk. " +
+      "Traces the data flow of a variable within a function chunk using " +
+      "heuristic pattern matching. " +
       "Identifies where the variable is assigned (source), where it's used (sinks), " +
       "and whether any user-controlled input flows into dangerous operations.",
     parameters: {
@@ -350,7 +354,8 @@ export function createTraceDataFlowTool(): AgentTool {
         varName: {
           type: "string",
           description:
-            "The variable name to trace (e.g., 'userInput', 'query').",
+            "The variable name to trace (e.g., 'userInput', 'query'). " +
+            "Also accepted as 'variableName' for compatibility.",
         },
         code: {
           type: "string",
@@ -360,11 +365,17 @@ export function createTraceDataFlowTool(): AgentTool {
       required: ["varName", "code"],
     },
     execute: async (args) => {
-      const varName = args["varName"] as string;
-      const code = args["code"] as string;
+      // Support both 'varName' and 'variableName' input shapes
+      const varName = (args["varName"] ?? args["variableName"]) as
+        | string
+        | undefined;
+      const code = args["code"] as string | undefined;
 
       if (!varName || !code) {
-        return JSON.stringify({ error: "varName and code are required" });
+        return JSON.stringify({
+          error:
+            "varName (or variableName) and code are required",
+        });
       }
 
       try {
