@@ -2,7 +2,7 @@
 
 ## What is this project?
 
-**Code-Analyser** is a tool that checks software projects and tells teams where problems may exist **before those problems become costly**.
+**Static Analyser** is a tool that checks software projects and tells teams where problems may exist **before those problems become costly**.
 
 Think of it like a **health check-up for code**:
 - It looks at a project carefully
@@ -11,9 +11,9 @@ Think of it like a **health check-up for code**:
 
 ---
 
-## Moto (Core Purpose)
+## Motto (Core Purpose)
 
-The moto of this project is:
+The motto of this project is:
 
 > **“Find issues early, explain them clearly, and help teams build safer, better software.”**
 
@@ -62,4 +62,4 @@ So instead of manually checking thousands of lines, teams get a guided summary o
 
 ## In one sentence
 
-**Code-Analyser’s purpose is to make software quality and risk visible, understandable, and actionable for both technical and non-technical teams.**
+**Static Analyser’s purpose is to make software quality and risk visible, understandable, and actionable for both technical and non-technical teams.**
